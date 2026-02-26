@@ -33,6 +33,8 @@ services:
       - ./init-scripts:/docker-entrypoint-initdb.d
       - ../out:/scripts/out
       - ../tabelas.conf:/scripts/tabelas.conf
+      - ../config.py:/scripts/config.py
+      - ../.env:/scripts/.env
       - ../base_testes_schema.py:/scripts/base_testes_schema.py
       - ../base_testes_replicar_dados_semcopy.py:/scripts/base_testes_replicar_dados_semcopy.py
       - ../base_testes_replicar_dados_comcopy.py:/scripts/base_testes_replicar_dados_comcopy.py

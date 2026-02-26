@@ -16,33 +16,48 @@ Uso:
 """
 
 import re
+import os
 import argparse
 import datetime as dt
 import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from tqdm import tqdm
 
 # =============================================================
+# CARREGA CREDENCIAIS DO .env.scripts
+# =============================================================
+_ENV_PATH = Path(__file__).parent / ".env"
+if not _ENV_PATH.exists():
+    _ENV_PATH = Path(__file__).parent.parent / ".env.scripts"
+if not _ENV_PATH.exists():
+    raise FileNotFoundError(
+        "Arquivo .env.scripts não encontrado. Crie-o a partir do .env.scripts.example:\n"
+        "  cp .env.scripts.example .env.scripts"
+    )
+load_dotenv(_ENV_PATH)
+
+# =============================================================
 # CONEXÕES
 # =============================================================
 PROD = dict(
-    host     = "10.80.91.30",
-    port     = 5432,
-    dbname   = "10.50.13.22_eleva",
-    user     = "mrfamos",
-    password = "Mikael1811!",
+    host     = os.environ["PROD_HOST"],
+    port     = int(os.environ.get("PROD_PORT", 5432)),
+    dbname   = os.environ["PROD_DB"],
+    user     = os.environ["PROD_USER"],
+    password = os.environ["PROD_PASS"],
 )
 
 DEV = dict(
-    host     = "localhost",
-    port     = 5432,
-    dbname   = "10.50.13.22_eleva_teste",
-    user     = "postgres",
-    password = "f5vcn32k",
+    host     = os.environ.get("DEV_HOST", "localhost"),
+    port     = int(os.environ.get("DEV_PORT", 5432)),
+    dbname   = os.environ["DEV_DB"],
+    user     = os.environ["DEV_USER"],
+    password = os.environ["DEV_PASS"],
 )
 
 SCHEMA      = "public"
@@ -325,7 +340,7 @@ def main():
         print("*** MODO DRY-RUN: nenhum dado será inserido ***\n")
 
     tabelas_conf = ler_config(Path(args.config))
-    workers      = min(args.workers, len(tabelas_conf))
+    workers      = 1 #min(args.workers, len(tabelas_conf))
 
     print(f"Configuração: {len(tabelas_conf)} tabela(s) | {workers} worker(s) paralelo(s)\n")
 

@@ -1,14 +1,27 @@
 import re
 import os
 import subprocess
+import platform
 from pathlib import Path
 from datetime import datetime
+from dotenv import load_dotenv
 
 # =========================
-# CONFIG (variáveis locais)
+# CARREGA CREDENCIAIS DO .env.scripts
 # =========================
+_ENV_PATH = Path(__file__).parent / ".env"
+if not _ENV_PATH.exists():
+    _ENV_PATH = Path(__file__).parent.parent / ".env.scripts"
+if not _ENV_PATH.exists():
+    raise FileNotFoundError(
+        "Arquivo .env.scripts não encontrado. Crie-o a partir do .env.scripts.example:\n"
+        "  cp .env.scripts.example .env.scripts"
+    )
+load_dotenv(_ENV_PATH)
 
-import platform
+# =========================
+# CONFIG
+# =========================
 
 # Binários do PostgreSQL — detecta automaticamente Windows ou Linux
 if platform.system() == "Windows":
@@ -20,20 +33,19 @@ else:
     PG_DUMP = "/usr/bin/pg_dump"
 
 # PRODUÇÃO (origem)
-PROD_HOST = "10.80.91.30"
-PROD_PORT = 5432
-PROD_DB   = "10.50.13.22_eleva"
-PROD_USER = "mrfamos"
-PROD_PASS = "Mikael1811!"
+PROD_HOST = os.environ["PROD_HOST"]
+PROD_PORT = int(os.environ.get("PROD_PORT", 5432))
+PROD_DB   = os.environ["PROD_DB"]
+PROD_USER = os.environ["PROD_USER"]
+PROD_PASS = os.environ["PROD_PASS"]
 
-# LOCAL/HML (destino)
-LOCAL_HOST       = "localhost"
-LOCAL_PORT       = 5432
-LOCAL_ADMIN_DB   = "postgres"
-LOCAL_ADMIN_USER = "postgres"
-LOCAL_ADMIN_PASS = "f5vcn32k"
-
-TARGET_DB = "10.50.13.22_eleva_teste"   # database que será recriado no local
+# LOCAL/Dev (destino)
+LOCAL_HOST       = os.environ.get("DEV_HOST", "localhost")
+LOCAL_PORT       = int(os.environ.get("DEV_PORT", 5432))
+LOCAL_ADMIN_DB   = os.environ.get("DEV_LOCAL_DB", "postgres")
+LOCAL_ADMIN_USER = os.environ["DEV_USER"]
+LOCAL_ADMIN_PASS = os.environ["DEV_PASS"]
+TARGET_DB        = os.environ["DEV_DB"]
 
 EXTENSIONS_TO_SKIP = [
     "adminpack",
