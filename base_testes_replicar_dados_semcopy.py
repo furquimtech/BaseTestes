@@ -29,17 +29,24 @@ from psycopg2.extras import RealDictCursor
 from tqdm import tqdm
 
 # =============================================================
-# CARREGA CREDENCIAIS DO .env.scripts
+# CARREGA CREDENCIAIS DO .env / .env.scripts
 # =============================================================
-_ENV_PATH = Path(__file__).parent / ".env"
-if not _ENV_PATH.exists():
-    _ENV_PATH = Path(__file__).parent.parent / ".env.scripts"
-if not _ENV_PATH.exists():
+def _encontrar_env() -> Path:
+    candidatos = [
+        Path(__file__).parent / ".env",
+        Path(__file__).parent.parent / ".env",
+        Path(__file__).parent / ".env.scripts",
+        Path(__file__).parent.parent / ".env.scripts",
+    ]
+    for p in candidatos:
+        if p.exists():
+            return p
     raise FileNotFoundError(
-        "Arquivo .env.scripts não encontrado. Crie-o a partir do .env.scripts.example:\n"
-        "  cp .env.scripts.example .env.scripts"
+        "Arquivo .env não encontrado. Crie-o a partir do .env.example:\n"
+        "  cp .env.example .env"
     )
-load_dotenv(_ENV_PATH)
+
+load_dotenv(_encontrar_env())
 
 # =============================================================
 # CONEXÕES
@@ -78,9 +85,16 @@ def tprint(msg: str) -> None:
 # =============================================================
 # LEITURA DO ARQUIVO DE CONFIGURAÇÃO
 # =============================================================
-def ler_config(path: Path) -> list[dict]:
+def ler_config(path: Path) -> tuple[list[dict], dict, int | None]:
     """
+    Lê o tabelas.conf e retorna:
+      - lista de itens de tabelas a replicar
+      - dicionário de mapeamento de tabelas herdadas { origem: {destino, pk} }
+      - número de workers definido via @workers (ou None se não configurado)
+
     Formatos aceitos por linha:
+        @workers | N                              -> define max workers
+        @mapa | origem | destino | pk (opcional) -> mapeamento de herança
         tabela
         tabela | coluna_data | dias
         tabela | coluna_data | dias | limit
@@ -89,13 +103,36 @@ def ler_config(path: Path) -> list[dict]:
     if not path.exists():
         raise FileNotFoundError(f"Arquivo de configuração não encontrado: {path}")
 
-    items = []
+    items   = []
+    mapa    = {}
+    workers = None
+
     for numero, linha in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         linha = linha.strip()
         if not linha or linha.startswith("#"):
             continue
 
         partes = [p.strip() for p in linha.split("|")]
+
+        # @workers | N
+        if partes[0] == "@workers":
+            if len(partes) != 2 or not partes[1].isdigit():
+                raise ValueError(f"Linha {numero}: '@workers' requer '@workers | N' onde N é um número inteiro")
+            workers = int(partes[1])
+            continue
+
+        # @mapa | origem | destino | pk (opcional)
+        if partes[0] == "@mapa":
+            if len(partes) < 3 or len(partes) > 4:
+                raise ValueError(f"Linha {numero}: '@mapa' requer '@mapa | origem | destino' ou '@mapa | origem | destino | pk'")
+            origem  = partes[1]
+            destino = partes[2]
+            pk      = partes[3] if len(partes) == 4 and partes[3] else None
+            mapa[origem] = {"destino": destino, "pk": pk}
+            pk_info = f" (pk: {pk})" if pk else ""
+            tprint(f"[MAPA] {origem} → {destino}{pk_info}")
+            continue
+
         if len(partes) > 4:
             raise ValueError(f"Linha {numero} inválida: '{linha}'")
 
@@ -120,7 +157,7 @@ def ler_config(path: Path) -> list[dict]:
     if not items:
         raise ValueError(f"Nenhuma tabela configurada em {path}")
 
-    return items
+    return items, mapa, workers
 
 # =============================================================
 # HELPERS DE BANCO
@@ -169,21 +206,43 @@ def buscar_por_pk(cur, tabela: str, pk_valor) -> dict | None:
     cur.execute(f"SELECT * FROM {qname(tabela)} WHERE {pk} = %s", (pk_valor,))
     return cur.fetchone()
 
-def inserir_registro(cur_dev, tabela: str, registro: dict, dry_run: bool) -> None:
-    """INSERT com ON CONFLICT (pk) DO NOTHING."""
+def inserir_registro(cur_dev, tabela: str, registro: dict,
+                     dry_run: bool, mapa_tabelas: dict) -> bool:
+    """
+    INSERT com ON CONFLICT (pk) DO NOTHING.
+    Se a tabela estiver no mapa_tabelas, redireciona o insert para a tabela destino
+    (ex: cbcontrato → cbcontratoeleva), usando a PK configurada se informada.
+    Usa SAVEPOINT para isolar erros sem derrubar a transação.
+    """
+    if dry_run:
+        return True
+
+    # Redireciona para tabela herdada se houver mapeamento
+    mapa_entry     = mapa_tabelas.get(tabela)
+    tabela_destino = mapa_entry["destino"] if mapa_entry else tabela
+    pk             = mapa_entry["pk"] if mapa_entry and mapa_entry["pk"] else pk_de(tabela_destino)
+
     colunas  = list(registro.keys())
     cols_sql = ", ".join(colunas)
     vals_sql = ", ".join([f"%({c})s" for c in colunas])
-    pk       = pk_de(tabela)
 
     sql = f"""
-        INSERT INTO {qname(tabela)} ({cols_sql})
+        INSERT INTO {qname(tabela_destino)} ({cols_sql})
         VALUES ({vals_sql})
         ON CONFLICT ({pk}) DO NOTHING
     """
 
-    if not dry_run:
+    cur_dev.execute("SAVEPOINT insert_row")
+    try:
         cur_dev.execute(sql, registro)
+        cur_dev.execute("RELEASE SAVEPOINT insert_row")
+        return True
+    except Exception as e:
+        cur_dev.execute("ROLLBACK TO SAVEPOINT insert_row")
+        cur_dev.execute("RELEASE SAVEPOINT insert_row")
+        pk_val = registro.get(pk_de(tabela), "?")
+        tprint(f"   [IGNORADO] {tabela} pk={pk_val}: {e}")
+        return False
 
 # =============================================================
 # RESOLUÇÃO DE DEPENDÊNCIAS
@@ -212,7 +271,8 @@ def dependencias_de(cur_prod, tabela: str, cache_colunas: dict) -> list[tuple[st
     return deps
 
 def inserir_com_deps(cur_prod, cur_dev, tabela: str, registro: dict,
-                     ja_inseridos: set, cache_colunas: dict, dry_run: bool) -> None:
+                     ja_inseridos: set, cache_colunas: dict,
+                     dry_run: bool, mapa_tabelas: dict) -> None:
     """
     Insere registro e suas dependências recursivamente.
     ja_inseridos é LOCAL a cada worker — não compartilhado entre threads.
@@ -240,15 +300,16 @@ def inserir_com_deps(cur_prod, cur_dev, tabela: str, registro: dict,
             continue
 
         inserir_com_deps(cur_prod, cur_dev, tabela_dep, registro_dep,
-                         ja_inseridos, cache_colunas, dry_run)
+                         ja_inseridos, cache_colunas, dry_run, mapa_tabelas)
 
     # 2) Insere o registro atual
-    inserir_registro(cur_dev, tabela, registro, dry_run)
+    inserir_registro(cur_dev, tabela, registro, dry_run, mapa_tabelas)
 
 # =============================================================
 # WORKER — processa uma tabela por completo
 # =============================================================
-def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm) -> dict:
+def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm,
+                     mapa_tabelas: dict, batch_size: int = BATCH_SIZE) -> dict:
     """
     Executado em thread separada. Cria suas próprias conexões
     prod e dev — psycopg2 não é thread-safe entre conexões.
@@ -266,7 +327,7 @@ def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm) -> dict:
         filtro_desc.append(f"LIMIT {limit}")
     filtro_str = " | ".join(filtro_desc) if filtro_desc else "sem filtro"
 
-    resultado = {"tabela": tabela, "inseridos": 0, "ignorados": 0, "erro": None}
+    resultado = {"tabela": tabela, "inseridos": 0, "ignorados": 0, "erros": 0, "erro": None}
 
     try:
         # Cada worker tem seu próprio par de conexões
@@ -294,19 +355,21 @@ def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm) -> dict:
 
                 inseridos = 0
                 ignorados = 0
+                erros     = 0
 
                 for i, reg in enumerate(registros):
                     antes = len(ja_inseridos)
                     inserir_com_deps(cur_prod, cur_dev, tabela, reg,
-                                     ja_inseridos, cache_colunas, dry_run)
+                                     ja_inseridos, cache_colunas, dry_run, mapa_tabelas)
 
-                    if len(ja_inseridos) > antes:
-                        inseridos += 1
+                    novos = len(ja_inseridos) - antes
+                    if novos > 0:
+                        inseridos += novos
                     else:
                         ignorados += 1
 
-                    # Commit a cada BATCH_SIZE registros
-                    if not dry_run and (i + 1) % BATCH_SIZE == 0:
+                    # Commit a cada batch_size registros
+                    if not dry_run and (i + 1) % batch_size == 0:
                         conn_dev.commit()
 
                     pbar_total.update(1)
@@ -317,7 +380,8 @@ def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm) -> dict:
 
                 resultado["inseridos"] = inseridos
                 resultado["ignorados"] = ignorados
-                tprint(f"[{tabela}] ✔ {inseridos} inserido(s), {ignorados} já existia(m)")
+                resultado["erros"]     = erros
+                tprint(f"[{tabela}] ✔ {inseridos} inserido(s), {ignorados} já existia(m), {erros} erro(s) ignorado(s)")
 
     except Exception as e:
         resultado["erro"] = str(e)
@@ -331,24 +395,38 @@ def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Replica dados de produção para dev via INSERT paralelo.")
     default_config = Path(__file__).parent / "tabelas.conf"
-    parser.add_argument("--config",  default=str(default_config))
-    parser.add_argument("--dry-run", action="store_true",       help="Simula sem inserir nada")
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help=f"Máx. workers paralelos (padrão: {MAX_WORKERS})")
+    parser.add_argument("--config",     default=str(default_config))
+    parser.add_argument("--dry-run",    action="store_true",           help="Simula sem inserir nada")
+    parser.add_argument("--workers",    type=int, default=MAX_WORKERS, help=f"Nº de tabelas em paralelo (padrão: {MAX_WORKERS})")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,  help=f"Commit a cada N registros (padrão: {BATCH_SIZE})")
     args = parser.parse_args()
 
     if args.dry_run:
         print("*** MODO DRY-RUN: nenhum dado será inserido ***\n")
 
-    tabelas_conf = ler_config(Path(args.config))
-    workers      = 1 #min(args.workers, len(tabelas_conf))
+    tabelas_conf, mapa_tabelas, workers_conf = ler_config(Path(args.config))
 
-    print(f"Configuração: {len(tabelas_conf)} tabela(s) | {workers} worker(s) paralelo(s)\n")
+    # Prioridade: --workers (CLI) > @workers (conf) > MAX_WORKERS (padrão)
+    workers = min(
+        args.workers if args.workers != MAX_WORKERS else (workers_conf or MAX_WORKERS),
+        len(tabelas_conf)
+    )
 
-    # Barra de progresso global (registros totais desconhecidos — modo indeterminado)
+    print(f"Configuração: {len(tabelas_conf)} tabela(s) | {workers} worker(s) | batch {args.batch_size}")
+    if workers_conf:
+        print(f"  (workers definido via @workers no conf)")
+    if mapa_tabelas:
+        print("Mapeamentos ativos:")
+        for origem, entry in mapa_tabelas.items():
+            pk_info = f" (pk: {entry['pk']})" if entry["pk"] else ""
+            print(f"  {origem} → {entry['destino']}{pk_info}")
+    print()
+
     with tqdm(desc="Registros processados", unit="reg", position=0) as pbar_total:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(processar_tabela, item, args.dry_run, pbar_total): item["tabela"]
+                executor.submit(processar_tabela, item, args.dry_run,
+                                pbar_total, mapa_tabelas, args.batch_size): item["tabela"]
                 for item in tabelas_conf
             }
 
@@ -357,21 +435,22 @@ def main():
                 resultados.append(future.result())
 
     # Resumo final
-    print(f"\n{'═'*60}")
-    print(f"{'Tabela':<30} {'Inseridos':>10} {'Ignorados':>10} {'Status':>10}")
-    print(f"{'─'*60}")
+    print(f"\n{'═'*70}")
+    print(f"{'Tabela':<30} {'Inseridos':>10} {'Ignorados':>10} {'Erros':>8} {'Status':>8}")
+    print(f"{'─'*70}")
 
     total_inseridos = 0
     total_erros     = 0
     for r in sorted(resultados, key=lambda x: x["tabela"]):
         status = "✖ ERRO" if r["erro"] else "✔ OK"
-        print(f"{r['tabela']:<30} {r['inseridos']:>10} {r['ignorados']:>10} {status:>10}")
+        erros_insert = r.get("erros", 0)
+        print(f"{r['tabela']:<30} {r['inseridos']:>10} {r['ignorados']:>10} {erros_insert:>8} {status:>8}")
         total_inseridos += r["inseridos"]
         if r["erro"]:
             total_erros += 1
             print(f"  └ {r['erro']}")
 
-    print(f"{'═'*60}")
+    print(f"{'═'*70}")
     print(f"Total inserido : {total_inseridos}")
     print(f"Tabelas com erro: {total_erros}")
     print("Concluído ✅" if total_erros == 0 else "Concluído com erros ⚠️")

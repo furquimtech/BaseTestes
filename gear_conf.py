@@ -140,7 +140,7 @@ def ordenar_topologicamente(tabelas: list, fks: list) -> list:
 # =============================================================
 def main():
     parser = argparse.ArgumentParser(description="Gera tabelas.conf com ordenação por FK.")
-    default_output = Path(__file__).parent / "tabelas.conf"
+    default_output = Path(__file__).parent / "tabelas_gerado.conf"
     parser.add_argument("--output",  default=str(default_output), help="Caminho do arquivo de saída")
     parser.add_argument("--dry-run", action="store_true",          help="Exibe no terminal sem gravar")
     args = parser.parse_args()

@@ -23,7 +23,7 @@ services:
         -c wal_buffers=64MB
         -c checkpoint_completion_target=0.9
         -c random_page_cost=1.1
-        -c max_connections=50
+        -c max_connections=500
 
     ports:
       - "5432:5432"
