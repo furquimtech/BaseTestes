@@ -21,7 +21,7 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).parent
 
 SCHEMA  = SCRIPTS_DIR / "base_testes_schema.py"
-DADOS   = SCRIPTS_DIR / "replicar_dados_semcopy.py"
+DADOS   = SCRIPTS_DIR / "base_testes_replicar_dados_semcopy.py"
 
 def separador(titulo: str) -> None:
     print(f"\n{'═'*60}")
@@ -78,5 +78,5 @@ def replica():
     print("  SETUP CONCLUÍDO ✅")
     print(f"{'═'*60}\n")
 
-if __name__ == "__replica__":
+if __name__ == "__main__":
     replica()

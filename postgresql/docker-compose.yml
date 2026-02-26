@@ -39,6 +39,7 @@ services:
       - ../base_testes_replicar_dados_semcopy.py:/scripts/base_testes_replicar_dados_semcopy.py
       - ../base_testes_replicar_dados_comcopy.py:/scripts/base_testes_replicar_dados_comcopy.py
       - ../replica.py:/scripts/replica.py
+      - ../gerar_conf.py:/scripts/gerar_conf.py
 
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dev_user} -d ${POSTGRES_DB:-dev_db}"]
