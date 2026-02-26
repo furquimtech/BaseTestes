@@ -157,7 +157,7 @@ docker exec -it postgres_dev python3 /scripts/base_testes_schema.py
 
 ### Replicação via INSERT (semcopy) — recomendado
 
-Insere os dados registro a registro com `ON CONFLICT DO NOTHING`, processando até 5 tabelas em paralelo. Resolve dependências de FK automaticamente:
+Insere os dados registro a registro com `ON CONFLICT DO NOTHING`, processando até X tabelas em paralelo. Resolve dependências de FK automaticamente:
 
 ```bash
 docker exec -it postgres_dev python3 /scripts/base_testes_replicar_dados_semcopy.py
@@ -165,22 +165,16 @@ docker exec -it postgres_dev python3 /scripts/base_testes_replicar_dados_semcopy
 docker exec -it postgres_dev python3 /scripts/base_testes_replicar_dados_semcopy.py --dry-run
 ```
 
-### Replicação via COPY (comcopy) — mais rápido
+### Replicação via COPY (comcopy) — ⚠️ em desenvolvimento
 
-Gera um arquivo `.sql` com blocos `COPY` e aplica em uma única transação. Mais rápido, porém substitui os dados existentes:
+> ⚠️ **Este script ainda não está funcional. Utilize o método `semcopy` para replicação de dados.**
+
+Quando concluído, irá gerar um arquivo `.sql` com blocos `COPY` e aplicar em uma única transação. Será mais rápido que o método INSERT, porém substituirá os dados existentes ao invés de ignorar duplicatas.
 
 ```bash
-# Gera e aplica
-docker exec -it postgres_dev python3 /scripts/base_testes_replicar_dados_comcopy.py
-
-# Só gera o .sql sem aplicar
-docker exec -it postgres_dev python3 /scripts/base_testes_replicar_dados_comcopy.py --apenas-gerar
-
-# Aplica o último .sql gerado
-docker exec -it postgres_dev python3 /scripts/base_testes_replicar_dados_comcopy.py --apenas-aplicar
+# ⚠️ Não executar — script em desenvolvimento
+# docker exec -it postgres_dev python3 /scripts/base_testes_replicar_dados_comcopy.py
 ```
-
-Os arquivos `.sql` gerados ficam disponíveis na pasta `out/` do Windows.
 
 ---
 
@@ -216,11 +210,12 @@ docker exec -it postgres_dev psql -U postgres -d 10.50.13.22_eleva_teste
 
 | | `semcopy` (INSERT) | `comcopy` (COPY) |
 |---|---|---|
-| **Velocidade** | Mais lento | Mais rápido |
+| **Status** | ✅ Funcional | ⚠️ Em desenvolvimento |
+| **Velocidade** | Moderado | Mais rápido (quando pronto) |
 | **Duplicatas** | Ignoradas (`ON CONFLICT`) | Substitui os dados |
-| **Paralelismo** | Até 5 tabelas simultâneas | Sequencial |
+| **Paralelismo** | Configurável via `@workers` | Sequencial |
 | **Arquivo gerado** | Não | Sim (`.sql` em `out/`) |
-| **Recomendado para** | Uso cotidiano | Carga inicial grande |
+| **Recomendado para** | Uso cotidiano | Carga inicial grande (futuro) |
 
 ---
 
