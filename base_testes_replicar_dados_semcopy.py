@@ -1,4 +1,4 @@
-"""
+﻿"""
 replicar_dados_semcopy.py
 -------------------------
 Conecta em produção, busca os registros configurados em tabelas.conf,
@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 from tqdm import tqdm
 
@@ -82,6 +83,58 @@ def tprint(msg: str) -> None:
     with _print_lock:
         tqdm.write(msg)
 
+def mascarar_nome(valor):
+    if valor is None or not isinstance(valor, str):
+        return valor
+
+    def _mascara_palavra(match: re.Match) -> str:
+        palavra = match.group(0)
+        if len(palavra) == 1:
+            return "*"
+        if len(palavra) == 2:
+            return palavra[0] + "*"
+        return palavra[0] + ("*" * (len(palavra) - 2)) + palavra[-1]
+
+    return re.sub(r"[A-Za-zÀ-ÿ]+", _mascara_palavra, valor)
+
+def mascarar_documento(valor):
+    if valor is None:
+        return valor
+    texto = str(valor)
+    return "".join("0" if ch.isdigit() else "X" if ch.isalpha() else ch for ch in texto)
+
+def coluna_parece_rg(coluna: str) -> bool:
+    c = coluna.lower()
+    return bool(
+        c.startswith("rg")
+        or c.endswith("_rg")
+        or "_rg_" in c
+        or re.search(r"(^|[^a-z0-9])rg([^a-z0-9]|$)", c)
+    )
+
+def mascarar_registro_sensivel(registro: dict) -> dict:
+    mascarado = dict(registro)
+    for coluna, valor in mascarado.items():
+        c = coluna.lower()
+        if "cpf" in c:
+            mascarado[coluna] = mascarar_documento(valor)
+        elif coluna_parece_rg(c):
+            mascarado[coluna] = mascarar_documento(valor)
+        elif "logradouro" in c:
+            mascarado[coluna] = mascarar_nome(valor)
+        elif "nome" in c:
+            mascarado[coluna] = mascarar_nome(valor)
+    return mascarado
+
+def int_positivo(valor: str) -> int:
+    try:
+        inteiro = int(valor)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Valor inválido: {valor}") from exc
+    if inteiro <= 0:
+        raise argparse.ArgumentTypeError(f"Valor deve ser > 0: {valor}")
+    return inteiro
+
 # =============================================================
 # LEITURA DO ARQUIVO DE CONFIGURAÇÃO
 # =============================================================
@@ -116,9 +169,14 @@ def ler_config(path: Path) -> tuple[list[dict], dict, int | None]:
 
         # @workers | N
         if partes[0] == "@workers":
-            if len(partes) != 2 or not partes[1].isdigit():
+            if len(partes) != 2:
                 raise ValueError(f"Linha {numero}: '@workers' requer '@workers | N' onde N é um número inteiro")
-            workers = int(partes[1])
+            try:
+                workers = int(partes[1])
+            except ValueError as exc:
+                raise ValueError(f"Linha {numero}: '@workers' deve ser inteiro.") from exc
+            if workers <= 0:
+                raise ValueError(f"Linha {numero}: '@workers' deve ser > 0.")
             continue
 
         # @mapa | origem | destino | pk (opcional)
@@ -144,8 +202,19 @@ def ler_config(path: Path) -> tuple[list[dict], dict, int | None]:
         if bool(coluna_data) != bool(dias):
             raise ValueError(f"Linha {numero}: 'coluna_data' e 'dias' devem ser preenchidos juntos.")
 
-        dias_int  = int(dias)  if dias  else None
-        limit_int = int(limit) if limit else None
+        try:
+            dias_int = int(dias) if dias else None
+        except ValueError as exc:
+            raise ValueError(f"Linha {numero}: 'dias' deve ser inteiro.") from exc
+        if dias_int is not None and dias_int < 0:
+            raise ValueError(f"Linha {numero}: 'dias' deve ser >= 0.")
+
+        try:
+            limit_int = int(limit) if limit else None
+        except ValueError as exc:
+            raise ValueError(f"Linha {numero}: 'limit' deve ser inteiro.") from exc
+        if limit_int is not None and limit_int <= 0:
+            raise ValueError(f"Linha {numero}: 'limit' deve ser > 0.")
 
         items.append({
             "tabela":      tabela,
@@ -184,26 +253,30 @@ def colunas_de(cur, tabela: str) -> list[str]:
 
 def buscar_registros(cur, tabela: str, coluna_data: str | None,
                      dias: int | None, limit: int | None) -> list[dict]:
-    sql    = f"SELECT * FROM {qname(tabela)}"
+    query  = sql.SQL("SELECT * FROM {}").format(sql.Identifier(SCHEMA, tabela))
     params = []
 
     if coluna_data and dias is not None:
         cutoff = dt.date.today() - dt.timedelta(days=dias)
-        sql   += f" WHERE {coluna_data} >= %s"
+        query += sql.SQL(" WHERE {} >= %s").format(sql.Identifier(coluna_data))
         params.append(cutoff)
 
-    sql += f" ORDER BY {pk_de(tabela)} DESC"
+    query += sql.SQL(" ORDER BY {} DESC").format(sql.Identifier(pk_de(tabela)))
 
     if limit is not None:
-        sql += " LIMIT %s"
+        query += sql.SQL(" LIMIT %s")
         params.append(limit)
 
-    cur.execute(sql, params)
+    cur.execute(query, params)
     return cur.fetchall()
 
 def buscar_por_pk(cur, tabela: str, pk_valor) -> dict | None:
     pk = pk_de(tabela)
-    cur.execute(f"SELECT * FROM {qname(tabela)} WHERE {pk} = %s", (pk_valor,))
+    query = sql.SQL("SELECT * FROM {} WHERE {} = %s").format(
+        sql.Identifier(SCHEMA, tabela),
+        sql.Identifier(pk),
+    )
+    cur.execute(query, (pk_valor,))
     return cur.fetchone()
 
 def inserir_registro(cur_dev, tabela: str, registro: dict,
@@ -221,20 +294,25 @@ def inserir_registro(cur_dev, tabela: str, registro: dict,
     mapa_entry     = mapa_tabelas.get(tabela)
     tabela_destino = mapa_entry["destino"] if mapa_entry else tabela
     pk             = mapa_entry["pk"] if mapa_entry and mapa_entry["pk"] else pk_de(tabela_destino)
+    registro_mask  = mascarar_registro_sensivel(registro)
 
-    colunas  = list(registro.keys())
-    cols_sql = ", ".join(colunas)
-    vals_sql = ", ".join([f"%({c})s" for c in colunas])
-
-    sql = f"""
-        INSERT INTO {qname(tabela_destino)} ({cols_sql})
-        VALUES ({vals_sql})
-        ON CONFLICT ({pk}) DO NOTHING
-    """
+    colunas  = list(registro_mask.keys())
+    cols_sql = sql.SQL(", ").join(sql.Identifier(c) for c in colunas)
+    vals_sql = sql.SQL(", ").join(sql.Placeholder(c) for c in colunas)
+    stmt = sql.SQL("""
+        INSERT INTO {} ({})
+        VALUES ({})
+        ON CONFLICT ({}) DO NOTHING
+    """).format(
+        sql.Identifier(SCHEMA, tabela_destino),
+        cols_sql,
+        vals_sql,
+        sql.Identifier(pk),
+    )
 
     cur_dev.execute("SAVEPOINT insert_row")
     try:
-        cur_dev.execute(sql, registro)
+        cur_dev.execute(stmt, registro_mask)
         cur_dev.execute("RELEASE SAVEPOINT insert_row")
         return True
     except Exception as e:
@@ -247,9 +325,18 @@ def inserir_registro(cur_dev, tabela: str, registro: dict,
 # =============================================================
 # RESOLUÇÃO DE DEPENDÊNCIAS
 # =============================================================
-RE_COLUNA_DEP = re.compile(r"^id_([a-z0-9]+)_int$", re.IGNORECASE)
+RE_COLUNA_DEP = re.compile(r"^id_([a-z0-9_]+)_int$", re.IGNORECASE)
 
-def dependencias_de(cur_prod, tabela: str, cache_colunas: dict) -> list[tuple[str, str]]:
+def dependencias_de(
+    cur_prod,
+    tabela: str,
+    cache_colunas: dict,
+    cache_dependencias: dict,
+    cache_tabela_existe: dict,
+) -> list[tuple[str, str]]:
+    if tabela in cache_dependencias:
+        return cache_dependencias[tabela]
+
     if tabela not in cache_colunas:
         cache_colunas[tabela] = colunas_de(cur_prod, tabela)
 
@@ -265,13 +352,17 @@ def dependencias_de(cur_prod, tabela: str, cache_colunas: dict) -> list[tuple[st
             continue
         if tabela_ref in DEPENDENCIA_IGNORAR:
             continue
-        if tabela_existe(cur_prod, tabela_ref):
+        if tabela_ref not in cache_tabela_existe:
+            cache_tabela_existe[tabela_ref] = tabela_existe(cur_prod, tabela_ref)
+        if cache_tabela_existe[tabela_ref]:
             deps.append((col, tabela_ref))
 
+    cache_dependencias[tabela] = deps
     return deps
 
 def inserir_com_deps(cur_prod, cur_dev, tabela: str, registro: dict,
                      ja_inseridos: set, cache_colunas: dict,
+                     cache_dependencias: dict, cache_tabela_existe: dict,
                      dry_run: bool, mapa_tabelas: dict) -> None:
     """
     Insere registro e suas dependências recursivamente.
@@ -289,7 +380,13 @@ def inserir_com_deps(cur_prod, cur_dev, tabela: str, registro: dict,
     ja_inseridos.add(chave)
 
     # 1) Resolve dependências primeiro
-    for coluna_fk, tabela_dep in dependencias_de(cur_prod, tabela, cache_colunas):
+    for coluna_fk, tabela_dep in dependencias_de(
+        cur_prod,
+        tabela,
+        cache_colunas,
+        cache_dependencias,
+        cache_tabela_existe,
+    ):
         id_dep = registro.get(coluna_fk)
         if id_dep is None:
             continue
@@ -300,7 +397,8 @@ def inserir_com_deps(cur_prod, cur_dev, tabela: str, registro: dict,
             continue
 
         inserir_com_deps(cur_prod, cur_dev, tabela_dep, registro_dep,
-                         ja_inseridos, cache_colunas, dry_run, mapa_tabelas)
+                         ja_inseridos, cache_colunas, cache_dependencias,
+                         cache_tabela_existe, dry_run, mapa_tabelas)
 
     # 2) Insere o registro atual
     inserir_registro(cur_dev, tabela, registro, dry_run, mapa_tabelas)
@@ -352,6 +450,8 @@ def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm,
 
                 ja_inseridos:  set[tuple[str, int]] = set()   # local por worker
                 cache_colunas: dict[str, list[str]] = {}      # local por worker
+                cache_dependencias: dict[str, list[tuple[str, str]]] = {}
+                cache_tabela_existe: dict[str, bool] = {}
 
                 inseridos = 0
                 ignorados = 0
@@ -360,7 +460,8 @@ def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm,
                 for i, reg in enumerate(registros):
                     antes = len(ja_inseridos)
                     inserir_com_deps(cur_prod, cur_dev, tabela, reg,
-                                     ja_inseridos, cache_colunas, dry_run, mapa_tabelas)
+                                     ja_inseridos, cache_colunas, cache_dependencias,
+                                     cache_tabela_existe, dry_run, mapa_tabelas)
 
                     novos = len(ja_inseridos) - antes
                     if novos > 0:
@@ -397,8 +498,8 @@ def main():
     default_config = Path(__file__).parent / "tabelas.conf"
     parser.add_argument("--config",     default=str(default_config))
     parser.add_argument("--dry-run",    action="store_true",           help="Simula sem inserir nada")
-    parser.add_argument("--workers",    type=int, default=MAX_WORKERS, help=f"Nº de tabelas em paralelo (padrão: {MAX_WORKERS})")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,  help=f"Commit a cada N registros (padrão: {BATCH_SIZE})")
+    parser.add_argument("--workers",    type=int_positivo, default=None, help=f"Nº de tabelas em paralelo (padrão: {MAX_WORKERS})")
+    parser.add_argument("--batch-size", type=int_positivo, default=BATCH_SIZE,  help=f"Commit a cada N registros (padrão: {BATCH_SIZE})")
     args = parser.parse_args()
 
     if args.dry_run:
@@ -407,10 +508,8 @@ def main():
     tabelas_conf, mapa_tabelas, workers_conf = ler_config(Path(args.config))
 
     # Prioridade: --workers (CLI) > @workers (conf) > MAX_WORKERS (padrão)
-    workers = min(
-        args.workers if args.workers != MAX_WORKERS else (workers_conf or MAX_WORKERS),
-        len(tabelas_conf)
-    )
+    workers_base = args.workers if args.workers is not None else (workers_conf or MAX_WORKERS)
+    workers = min(workers_base, len(tabelas_conf))
 
     print(f"Configuração: {len(tabelas_conf)} tabela(s) | {workers} worker(s) | batch {args.batch_size}")
     if workers_conf:
