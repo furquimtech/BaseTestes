@@ -1,31 +1,25 @@
-﻿"""
+"""
 base_testes_replicar_dados_parquet.py
 -------------------------------------
-Conecta em producao, busca os registros configurados em tabelas.conf,
-salva cada tabela em arquivo .parquet dentro de parquet/<nome_database>
-e executa deduplicacao por chave primaria da tabela.
-
-Uso:
-    python base_testes_replicar_dados_parquet.py
-    python base_testes_replicar_dados_parquet.py --config outro_arquivo.conf
-    python base_testes_replicar_dados_parquet.py --dry-run
-    python base_testes_replicar_dados_parquet.py --workers 3
+Exporta tabelas de PROD para arquivos parquet/<DEV_DB>/<tabela>.parquet,
+deduplica por PK e tambem suporta importar esses parquets para o banco DEV.
 """
 
-import re
-import os
 import argparse
 import datetime as dt
+import os
+import re
 import threading
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
+from pathlib import Path
 
 import pandas as pd
 import psycopg2
+from dotenv import load_dotenv
 from psycopg2 import sql
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 from tqdm import tqdm
+
 
 # =============================================================
 # CARREGA CREDENCIAIS DO .env / .env.scripts
@@ -41,70 +35,208 @@ def _encontrar_env() -> Path:
         if p.exists():
             return p
     raise FileNotFoundError(
-        "Arquivo .env nÃ£o encontrado. Crie-o a partir do .env.example:\n"
+        "Arquivo .env nao encontrado. Crie-o a partir do .env.example:\n"
         "  cp .env.example .env"
     )
+
 
 load_dotenv(_encontrar_env())
 
 # =============================================================
-# CONEXÃ•ES
+# CONEXOES
 # =============================================================
 PROD = dict(
-    host     = os.environ["PROD_HOST"],
-    port     = int(os.environ.get("PROD_PORT", 5432)),
-    dbname   = os.environ["PROD_DB"],
-    user     = os.environ["PROD_USER"],
-    password = os.environ["PROD_PASS"],
+    host=os.environ["PROD_HOST"],
+    port=int(os.environ.get("PROD_PORT", 5432)),
+    dbname=os.environ["PROD_DB"],
+    user=os.environ["PROD_USER"],
+    password=os.environ["PROD_PASS"],
 )
 
 DEV = dict(
-    host     = os.environ.get("DEV_HOST", "localhost"),
-    port     = int(os.environ.get("DEV_PORT", 5432)),
-    dbname   = os.environ["DEV_DB"],
-    user     = os.environ["DEV_USER"],
-    password = os.environ["DEV_PASS"],
+    host=os.environ.get("DEV_HOST", "localhost"),
+    port=int(os.environ.get("DEV_PORT", 5432)),
+    dbname=os.environ["DEV_DB"],
+    user=os.environ["DEV_USER"],
+    password=os.environ["DEV_PASS"],
 )
 
-SCHEMA      = "public"
+SCHEMA = "public"
 MAX_WORKERS = 5
-BATCH_SIZE  = 100
+BATCH_SIZE = 100
 
-# Tabelas que NÃƒO devem ser resolvidas como dependÃªncia
-DEPENDENCIA_IGNORAR: set[str] = set()
-
-# Lock para o tqdm (saÃ­da no terminal compartilhada entre threads)
 _print_lock = threading.Lock()
 
+
 def tprint(msg: str) -> None:
-    """tqdm.write thread-safe."""
     with _print_lock:
         tqdm.write(msg)
 
+
+# =============================================================
+# UTILITARIOS
+# =============================================================
 def diretorio_base_parquet() -> Path:
-    """Cria e retorna parquet/<DEV_DB>."""
-    db_name = DEV["dbname"]
-    base_dir = Path(__file__).parent / "parquet" / db_name
+    base_dir = Path(__file__).parent / "parquet" / DEV["dbname"]
     base_dir.mkdir(parents=True, exist_ok=True)
     return base_dir
 
+
 def caminho_parquet_tabela(base_dir: Path, tabela: str) -> Path:
     return base_dir / f"{tabela}.parquet"
+
+
+def qname(tabela: str) -> str:
+    return f"{SCHEMA}.{tabela}"
+
+
+def pk_de(tabela: str) -> str:
+    return f"id_{tabela}_int"
+
+
+def int_positivo(valor: str) -> int:
+    try:
+        inteiro = int(valor)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Valor invalido: {valor}") from exc
+    if inteiro <= 0:
+        raise argparse.ArgumentTypeError(f"Valor deve ser > 0: {valor}")
+    return inteiro
+
+
+def adaptar_valor_pg(valor):
+    if pd.isna(valor):
+        return None
+    if hasattr(valor, "to_pydatetime"):
+        return valor.to_pydatetime()
+    if hasattr(valor, "item"):
+        try:
+            return valor.item()
+        except Exception:
+            return valor
+    return valor
+
+
+# =============================================================
+# LEITURA DE CONFIG
+# =============================================================
+def ler_config(path: Path) -> tuple[list[dict], dict, int | None]:
+    if not path.exists():
+        raise FileNotFoundError(f"Arquivo de configuracao nao encontrado: {path}")
+
+    items = []
+    mapa = {}
+    workers = None
+
+    for numero, linha in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        linha = linha.strip()
+        if not linha or linha.startswith("#"):
+            continue
+
+        partes = [p.strip() for p in linha.split("|")]
+
+        if partes[0] == "@workers":
+            if len(partes) != 2:
+                raise ValueError(f"Linha {numero}: use '@workers | N'")
+            try:
+                workers = int(partes[1])
+            except ValueError as exc:
+                raise ValueError(f"Linha {numero}: '@workers' deve ser inteiro") from exc
+            if workers <= 0:
+                raise ValueError(f"Linha {numero}: '@workers' deve ser > 0")
+            continue
+
+        if partes[0] == "@mapa":
+            if len(partes) < 3 or len(partes) > 4:
+                raise ValueError(
+                    f"Linha {numero}: '@mapa | origem | destino' ou '@mapa | origem | destino | pk'"
+                )
+            origem = partes[1]
+            destino = partes[2]
+            pk = partes[3] if len(partes) == 4 and partes[3] else None
+            mapa[origem] = {"destino": destino, "pk": pk}
+            continue
+
+        if len(partes) > 4:
+            raise ValueError(f"Linha {numero} invalida: '{linha}'")
+
+        while len(partes) < 4:
+            partes.append("")
+
+        tabela, coluna_data, dias, limit = partes
+
+        if bool(coluna_data) != bool(dias):
+            raise ValueError(f"Linha {numero}: 'coluna_data' e 'dias' devem vir juntos")
+
+        try:
+            dias_int = int(dias) if dias else None
+        except ValueError as exc:
+            raise ValueError(f"Linha {numero}: 'dias' deve ser inteiro") from exc
+        if dias_int is not None and dias_int < 0:
+            raise ValueError(f"Linha {numero}: 'dias' deve ser >= 0")
+
+        try:
+            limit_int = int(limit) if limit else None
+        except ValueError as exc:
+            raise ValueError(f"Linha {numero}: 'limit' deve ser inteiro") from exc
+        if limit_int is not None and limit_int <= 0:
+            raise ValueError(f"Linha {numero}: 'limit' deve ser > 0")
+
+        items.append(
+            {
+                "tabela": tabela,
+                "coluna_data": coluna_data or None,
+                "dias": dias_int,
+                "limit": limit_int,
+            }
+        )
+
+    if not items:
+        raise ValueError(f"Nenhuma tabela configurada em {path}")
+
+    return items, mapa, workers
+
+
+# =============================================================
+# EXPORTACAO PARA PARQUET
+# =============================================================
+def tabela_existe(cur, tabela: str) -> bool:
+    cur.execute("SELECT to_regclass(%s) AS oid", (qname(tabela),))
+    row = cur.fetchone()
+    return row is not None and row["oid"] is not None
+
+
+def buscar_registros(cur, tabela: str, coluna_data: str | None, dias: int | None, limit: int | None) -> list[dict]:
+    query = sql.SQL("SELECT * FROM {}") .format(sql.Identifier(SCHEMA, tabela))
+    params = []
+
+    if coluna_data and dias is not None:
+        cutoff = dt.date.today() - dt.timedelta(days=dias)
+        query += sql.SQL(" WHERE {} >= %s").format(sql.Identifier(coluna_data))
+        params.append(cutoff)
+
+    query += sql.SQL(" ORDER BY {} DESC").format(sql.Identifier(pk_de(tabela)))
+
+    if limit is not None:
+        query += sql.SQL(" LIMIT %s")
+        params.append(limit)
+
+    cur.execute(query, params)
+    return cur.fetchall()
+
 
 def salvar_em_parquet(path_arquivo: Path, registros: list[dict]) -> int:
     if not registros:
         if path_arquivo.exists():
             path_arquivo.unlink()
         return 0
+
     df = pd.DataFrame(registros)
     df.to_parquet(path_arquivo, index=False)
     return len(df)
 
+
 def deduplicar_arquivo_parquet(path_arquivo: Path, tabela: str) -> tuple[int, int]:
-    """
-    Deduplica por chave primÃ¡ria da tabela, mantendo o primeiro registro.
-    Retorna (total_apos_dedup, removidos).
-    """
     if not path_arquivo.exists():
         return 0, 0
 
@@ -123,347 +255,12 @@ def deduplicar_arquivo_parquet(path_arquivo: Path, tabela: str) -> tuple[int, in
         df.to_parquet(path_arquivo, index=False)
     return len(df), removidos
 
-def mascarar_nome(valor):
-    if valor is None or not isinstance(valor, str):
-        return valor
 
-    def _mascara_palavra(match: re.Match) -> str:
-        palavra = match.group(0)
-        if len(palavra) == 1:
-            return "*"
-        if len(palavra) == 2:
-            return palavra[0] + "*"
-        return palavra[0] + ("*" * (len(palavra) - 2)) + palavra[-1]
-
-    return re.sub(r"[A-Za-zÃ€-Ã¿]+", _mascara_palavra, valor)
-
-def mascarar_documento(valor):
-    if valor is None:
-        return valor
-    texto = str(valor)
-    return "".join("0" if ch.isdigit() else "X" if ch.isalpha() else ch for ch in texto)
-
-def coluna_parece_rg(coluna: str) -> bool:
-    c = coluna.lower()
-    return bool(
-        c.startswith("rg")
-        or c.endswith("_rg")
-        or "_rg_" in c
-        or re.search(r"(^|[^a-z0-9])rg([^a-z0-9]|$)", c)
-    )
-
-def mascarar_registro_sensivel(registro: dict) -> dict:
-    mascarado = dict(registro)
-    for coluna, valor in mascarado.items():
-        c = coluna.lower()
-        if "cpf" in c:
-            mascarado[coluna] = mascarar_documento(valor)
-        elif coluna_parece_rg(c):
-            mascarado[coluna] = mascarar_documento(valor)
-        elif "logradouro" in c:
-            mascarado[coluna] = mascarar_nome(valor)
-        elif "nome" in c:
-            mascarado[coluna] = mascarar_nome(valor)
-    return mascarado
-
-def int_positivo(valor: str) -> int:
-    try:
-        inteiro = int(valor)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"Valor invÃ¡lido: {valor}") from exc
-    if inteiro <= 0:
-        raise argparse.ArgumentTypeError(f"Valor deve ser > 0: {valor}")
-    return inteiro
-
-# =============================================================
-# LEITURA DO ARQUIVO DE CONFIGURAÃ‡ÃƒO
-# =============================================================
-def ler_config(path: Path) -> tuple[list[dict], dict, int | None]:
-    """
-    LÃª o tabelas.conf e retorna:
-      - lista de itens de tabelas a replicar
-      - dicionÃ¡rio de mapeamento de tabelas herdadas { origem: {destino, pk} }
-      - nÃºmero de workers definido via @workers (ou None se nÃ£o configurado)
-
-    Formatos aceitos por linha:
-        @workers | N                              -> define max workers
-        @mapa | origem | destino | pk (opcional) -> mapeamento de heranÃ§a
-        tabela
-        tabela | coluna_data | dias
-        tabela | coluna_data | dias | limit
-        tabela | | | limit
-    """
-    if not path.exists():
-        raise FileNotFoundError(f"Arquivo de configuraÃ§Ã£o nÃ£o encontrado: {path}")
-
-    items   = []
-    mapa    = {}
-    workers = None
-
-    for numero, linha in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        linha = linha.strip()
-        if not linha or linha.startswith("#"):
-            continue
-
-        partes = [p.strip() for p in linha.split("|")]
-
-        # @workers | N
-        if partes[0] == "@workers":
-            if len(partes) != 2:
-                raise ValueError(f"Linha {numero}: '@workers' requer '@workers | N' onde N Ã© um nÃºmero inteiro")
-            try:
-                workers = int(partes[1])
-            except ValueError as exc:
-                raise ValueError(f"Linha {numero}: '@workers' deve ser inteiro.") from exc
-            if workers <= 0:
-                raise ValueError(f"Linha {numero}: '@workers' deve ser > 0.")
-            continue
-
-        # @mapa | origem | destino | pk (opcional)
-        if partes[0] == "@mapa":
-            if len(partes) < 3 or len(partes) > 4:
-                raise ValueError(f"Linha {numero}: '@mapa' requer '@mapa | origem | destino' ou '@mapa | origem | destino | pk'")
-            origem  = partes[1]
-            destino = partes[2]
-            pk      = partes[3] if len(partes) == 4 and partes[3] else None
-            mapa[origem] = {"destino": destino, "pk": pk}
-            pk_info = f" (pk: {pk})" if pk else ""
-            tprint(f"[MAPA] {origem} â†’ {destino}{pk_info}")
-            continue
-
-        if len(partes) > 4:
-            raise ValueError(f"Linha {numero} invÃ¡lida: '{linha}'")
-
-        while len(partes) < 4:
-            partes.append("")
-
-        tabela, coluna_data, dias, limit = partes
-
-        if bool(coluna_data) != bool(dias):
-            raise ValueError(f"Linha {numero}: 'coluna_data' e 'dias' devem ser preenchidos juntos.")
-
-        try:
-            dias_int = int(dias) if dias else None
-        except ValueError as exc:
-            raise ValueError(f"Linha {numero}: 'dias' deve ser inteiro.") from exc
-        if dias_int is not None and dias_int < 0:
-            raise ValueError(f"Linha {numero}: 'dias' deve ser >= 0.")
-
-        try:
-            limit_int = int(limit) if limit else None
-        except ValueError as exc:
-            raise ValueError(f"Linha {numero}: 'limit' deve ser inteiro.") from exc
-        if limit_int is not None and limit_int <= 0:
-            raise ValueError(f"Linha {numero}: 'limit' deve ser > 0.")
-
-        items.append({
-            "tabela":      tabela,
-            "coluna_data": coluna_data or None,
-            "dias":        dias_int,
-            "limit":       limit_int,
-        })
-
-    if not items:
-        raise ValueError(f"Nenhuma tabela configurada em {path}")
-
-    return items, mapa, workers
-
-# =============================================================
-# HELPERS DE BANCO
-# =============================================================
-def qname(tabela: str) -> str:
-    return f"{SCHEMA}.{tabela}"
-
-def pk_de(tabela: str) -> str:
-    return f"id_{tabela}_int"
-
-def tabela_existe(cur, tabela: str) -> bool:
-    cur.execute("SELECT to_regclass(%s) AS oid", (qname(tabela),))
-    row = cur.fetchone()
-    return row is not None and row["oid"] is not None
-
-def colunas_de(cur, tabela: str) -> list[str]:
-    cur.execute("""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = %s
-        ORDER BY ordinal_position
-    """, (SCHEMA, tabela))
-    return [r["column_name"] for r in cur.fetchall()]
-
-def buscar_registros(cur, tabela: str, coluna_data: str | None,
-                     dias: int | None, limit: int | None) -> list[dict]:
-    query  = sql.SQL("SELECT * FROM {}").format(sql.Identifier(SCHEMA, tabela))
-    params = []
-
-    if coluna_data and dias is not None:
-        cutoff = dt.date.today() - dt.timedelta(days=dias)
-        query += sql.SQL(" WHERE {} >= %s").format(sql.Identifier(coluna_data))
-        params.append(cutoff)
-
-    query += sql.SQL(" ORDER BY {} DESC").format(sql.Identifier(pk_de(tabela)))
-
-    if limit is not None:
-        query += sql.SQL(" LIMIT %s")
-        params.append(limit)
-
-    cur.execute(query, params)
-    return cur.fetchall()
-
-def buscar_por_pk(cur, tabela: str, pk_valor) -> dict | None:
-    pk = pk_de(tabela)
-    query = sql.SQL("SELECT * FROM {} WHERE {} = %s").format(
-        sql.Identifier(SCHEMA, tabela),
-        sql.Identifier(pk),
-    )
-    cur.execute(query, (pk_valor,))
-    return cur.fetchone()
-
-def inserir_registro(cur_dev, tabela: str, registro: dict,
-                     dry_run: bool, mapa_tabelas: dict) -> bool:
-    """
-    INSERT com ON CONFLICT (pk) DO NOTHING.
-    Se a tabela estiver no mapa_tabelas, redireciona o insert para a tabela destino
-    (ex: cbcontrato â†’ cbcontratoeleva), usando a PK configurada se informada.
-    Usa SAVEPOINT para isolar erros sem derrubar a transaÃ§Ã£o.
-    """
-    if dry_run:
-        return True
-
-    # Redireciona para tabela herdada se houver mapeamento
-    mapa_entry     = mapa_tabelas.get(tabela)
-    tabela_destino = mapa_entry["destino"] if mapa_entry else tabela
-    pk             = mapa_entry["pk"] if mapa_entry and mapa_entry["pk"] else pk_de(tabela_destino)
-    registro_mask  = mascarar_registro_sensivel(registro)
-
-    colunas  = list(registro_mask.keys())
-    cols_sql = sql.SQL(", ").join(sql.Identifier(c) for c in colunas)
-    vals_sql = sql.SQL(", ").join(sql.Placeholder(c) for c in colunas)
-    stmt = sql.SQL("""
-        INSERT INTO {} ({})
-        VALUES ({})
-        ON CONFLICT ({}) DO NOTHING
-    """).format(
-        sql.Identifier(SCHEMA, tabela_destino),
-        cols_sql,
-        vals_sql,
-        sql.Identifier(pk),
-    )
-
-    cur_dev.execute("SAVEPOINT insert_row")
-    try:
-        cur_dev.execute(stmt, registro_mask)
-        cur_dev.execute("RELEASE SAVEPOINT insert_row")
-        return True
-    except Exception as e:
-        cur_dev.execute("ROLLBACK TO SAVEPOINT insert_row")
-        cur_dev.execute("RELEASE SAVEPOINT insert_row")
-        pk_val = registro.get(pk_de(tabela), "?")
-        tprint(f"   [IGNORADO] {tabela} pk={pk_val}: {e}")
-        return False
-
-# =============================================================
-# RESOLUÃ‡ÃƒO DE DEPENDÃŠNCIAS
-# =============================================================
-RE_COLUNA_DEP = re.compile(r"^id_([a-z0-9_]+)_int$", re.IGNORECASE)
-
-def dependencias_de(
-    cur_prod,
-    tabela: str,
-    cache_colunas: dict,
-    cache_dependencias: dict,
-    cache_tabela_existe: dict,
-) -> list[tuple[str, str]]:
-    if tabela in cache_dependencias:
-        return cache_dependencias[tabela]
-
-    if tabela not in cache_colunas:
-        cache_colunas[tabela] = colunas_de(cur_prod, tabela)
-
-    deps = []
-    for col in cache_colunas[tabela]:
-        match = RE_COLUNA_DEP.match(col)
-        if not match:
-            continue
-
-        tabela_ref = match.group(1).lower()
-
-        if tabela_ref == tabela.lower():
-            continue
-        if tabela_ref in DEPENDENCIA_IGNORAR:
-            continue
-        if tabela_ref not in cache_tabela_existe:
-            cache_tabela_existe[tabela_ref] = tabela_existe(cur_prod, tabela_ref)
-        if cache_tabela_existe[tabela_ref]:
-            deps.append((col, tabela_ref))
-
-    cache_dependencias[tabela] = deps
-    return deps
-
-def inserir_com_deps(cur_prod, cur_dev, tabela: str, registro: dict,
-                     ja_inseridos: set, cache_colunas: dict,
-                     cache_dependencias: dict, cache_tabela_existe: dict,
-                     dry_run: bool, mapa_tabelas: dict) -> None:
-    """
-    Insere registro e suas dependÃªncias recursivamente.
-    ja_inseridos Ã© LOCAL a cada worker â€” nÃ£o compartilhado entre threads.
-    ON CONFLICT DO NOTHING resolve colisÃµes entre workers no banco.
-    """
-    pk_val = registro.get(pk_de(tabela))
-    if pk_val is None:
-        return
-
-    chave = (tabela, int(pk_val))
-    if chave in ja_inseridos:
-        return
-
-    ja_inseridos.add(chave)
-
-    # 1) Resolve dependÃªncias primeiro
-    for coluna_fk, tabela_dep in dependencias_de(
-        cur_prod,
-        tabela,
-        cache_colunas,
-        cache_dependencias,
-        cache_tabela_existe,
-    ):
-        id_dep = registro.get(coluna_fk)
-        if id_dep is None:
-            continue
-
-        registro_dep = buscar_por_pk(cur_prod, tabela_dep, id_dep)
-        if registro_dep is None:
-            tprint(f"   [AVISO] {tabela}.{coluna_fk}={id_dep} â†’ {tabela_dep} nÃ£o encontrado, ignorando.")
-            continue
-
-        inserir_com_deps(cur_prod, cur_dev, tabela_dep, registro_dep,
-                         ja_inseridos, cache_colunas, cache_dependencias,
-                         cache_tabela_existe, dry_run, mapa_tabelas)
-
-    # 2) Insere o registro atual
-    inserir_registro(cur_dev, tabela, registro, dry_run, mapa_tabelas)
-
-# =============================================================
-# WORKER â€” processa uma tabela por completo
-# =============================================================
-def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm,
-                     mapa_tabelas: dict, parquet_dir: Path,
-                     batch_size: int = BATCH_SIZE) -> dict:
-    """
-    Executado em thread separada. Cria sua propria conexao com producao
-    e retorna o resultado da gravacao/deduplicacao.
-    """
-    tabela      = item["tabela"]
+def processar_tabela_export(item: dict, dry_run: bool, pbar_total: tqdm, parquet_dir: Path) -> dict:
+    tabela = item["tabela"]
     coluna_data = item["coluna_data"]
-    dias        = item["dias"]
-    limit       = item["limit"]
-
-    filtro_desc = []
-    if coluna_data and dias is not None:
-        filtro_desc.append(f"{coluna_data} >= hoje-{dias}d")
-    if limit is not None:
-        filtro_desc.append(f"LIMIT {limit}")
-    filtro_str = " | ".join(filtro_desc) if filtro_desc else "sem filtro"
+    dias = item["dias"]
+    limit = item["limit"]
 
     resultado = {
         "tabela": tabela,
@@ -474,24 +271,19 @@ def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm,
     }
 
     try:
-        # Cada worker tem sua propria conexao com producao
         with psycopg2.connect(**PROD) as conn_prod:
             conn_prod.autocommit = True
-
             with conn_prod.cursor(cursor_factory=RealDictCursor) as cur_prod:
                 if not tabela_existe(cur_prod, tabela):
-                    tprint(f"[AVISO] {tabela}: nÃ£o existe em produÃ§Ã£o, pulando.")
+                    tprint(f"[AVISO] {tabela}: nao existe em producao, pulando")
                     return resultado
 
                 registros = buscar_registros(cur_prod, tabela, coluna_data, dias, limit)
-                tprint(f"\n{'â”€'*60}")
-                tprint(f"[{tabela}] {filtro_str} | {len(registros)} registro(s)")
-
                 for _ in registros:
                     pbar_total.update(1)
 
                 if dry_run:
-                    tprint(f"[{tabela}] DRY-RUN: {len(registros)} registro(s) seriam gravados em parquet")
+                    tprint(f"[{tabela}] DRY-RUN export: {len(registros)} registro(s)")
                     return resultado
 
                 caminho_saida = caminho_parquet_tabela(parquet_dir, tabela)
@@ -502,73 +294,176 @@ def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm,
                 resultado["apos_dedup"] = apos_dedup
                 resultado["deduplicados"] = removidos
                 tprint(
-                    f"[{tabela}] âœ” parquet salvo em {caminho_saida.name} | "
-                    f"gravados={gravados}, deduplicados={removidos}, final={apos_dedup}"
+                    f"[{tabela}] parquet={caminho_saida.name} gravados={gravados} "
+                    f"deduplicados={removidos} final={apos_dedup}"
                 )
-
     except Exception as e:
         resultado["erro"] = str(e)
-        tprint(f"[{tabela}] âœ– ERRO: {e}")
+        tprint(f"[{tabela}] ERRO export: {e}")
 
     return resultado
 
-# =============================================================
-# MAIN
-# =============================================================
-def main():
-    parser = argparse.ArgumentParser(description="Extrai dados de produÃ§Ã£o e salva em arquivos Parquet.")
-    default_config = Path(__file__).parent / "tabelas.conf"
-    parser.add_argument("--config",     default=str(default_config))
-    parser.add_argument("--dry-run",    action="store_true",           help="Simula sem inserir nada")
-    parser.add_argument("--workers",    type=int_positivo, default=None, help=f"NÂº de tabelas em paralelo (padrÃ£o: {MAX_WORKERS})")
-    parser.add_argument("--batch-size", type=int_positivo, default=BATCH_SIZE,  help=f"Commit a cada N registros (padrÃ£o: {BATCH_SIZE})")
-    args = parser.parse_args()
 
-    if args.dry_run:
-        print("*** MODO DRY-RUN: nenhum arquivo sera gravado ***\n")
-
-    tabelas_conf, mapa_tabelas, workers_conf = ler_config(Path(args.config))
-
-    # Prioridade: --workers (CLI) > @workers (conf) > MAX_WORKERS (padrÃ£o)
-    workers_base = args.workers if args.workers is not None else (workers_conf or MAX_WORKERS)
-    workers = min(workers_base, len(tabelas_conf))
-
-    parquet_dir = diretorio_base_parquet()
-
-    print(f"ConfiguraÃ§Ã£o: {len(tabelas_conf)} tabela(s) | {workers} worker(s) | batch {args.batch_size}")
-    print(f"DiretÃ³rio parquet: {parquet_dir}")
-    if workers_conf:
-        print(f"  (workers definido via @workers no conf)")
-    if mapa_tabelas:
-        print("Mapeamentos ativos:")
-        for origem, entry in mapa_tabelas.items():
-            pk_info = f" (pk: {entry['pk']})" if entry["pk"] else ""
-            print(f"  {origem} â†’ {entry['destino']}{pk_info}")
-    print()
-
+def executar_exportacao(tabelas_conf: list[dict], workers: int, dry_run: bool, parquet_dir: Path) -> list[dict]:
     with tqdm(desc="Registros processados", unit="reg", position=0) as pbar_total:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                    executor.submit(processar_tabela, item, args.dry_run,
-                                pbar_total, mapa_tabelas, parquet_dir, args.batch_size): item["tabela"]
+                executor.submit(processar_tabela_export, item, dry_run, pbar_total, parquet_dir): item["tabela"]
                 for item in tabelas_conf
             }
+            return [future.result() for future in as_completed(futures)]
 
-            resultados = []
-            for future in as_completed(futures):
-                resultados.append(future.result())
 
-    # Resumo final
-    print(f"\n{'â•'*70}")
+# =============================================================
+# IMPORTACAO DE PARQUET PARA DEV
+# =============================================================
+def colunas_de_tabela(cur, tabela: str) -> list[str]:
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+        ORDER BY ordinal_position
+        """,
+        (SCHEMA, tabela),
+    )
+    return [r[0] for r in cur.fetchall()]
+
+
+def inserir_dataframe_em_tabela(cur_dev, tabela_destino: str, df: pd.DataFrame, batch_size: int) -> tuple[int, int]:
+    if df.empty:
+        return 0, 0
+
+    colunas_tabela = colunas_de_tabela(cur_dev, tabela_destino)
+    colunas_insert = [c for c in df.columns if c in colunas_tabela]
+    if not colunas_insert:
+        raise ValueError(f"{tabela_destino}: nenhuma coluna em comum entre parquet e tabela")
+
+    dados = df[colunas_insert]
+    total_lidos = len(dados)
+    inseridos = 0
+
+    cols_sql = sql.SQL(", ").join(sql.Identifier(c) for c in colunas_insert)
+    stmt = sql.SQL("INSERT INTO {} ({}) VALUES %s ON CONFLICT DO NOTHING").format(
+        sql.Identifier(SCHEMA, tabela_destino),
+        cols_sql,
+    )
+
+    for inicio in range(0, total_lidos, batch_size):
+        fim = min(inicio + batch_size, total_lidos)
+        chunk = dados.iloc[inicio:fim]
+        valores = [
+            tuple(adaptar_valor_pg(v) for v in row)
+            for row in chunk.itertuples(index=False, name=None)
+        ]
+        execute_values(cur_dev, stmt, valores, page_size=batch_size)
+        inseridos += max(cur_dev.rowcount, 0)
+
+    ignorados = total_lidos - inseridos
+    return inseridos, ignorados
+
+
+def importar_parquets_para_dev(
+    tabelas_conf: list[dict],
+    mapa_tabelas: dict,
+    parquet_dir: Path,
+    dry_run: bool,
+    batch_size: int,
+    disable_fks: bool,
+) -> list[dict]:
+    resultados = []
+    conn_dev = psycopg2.connect(**DEV)
+    conn_dev.autocommit = False
+
+    try:
+        with conn_dev.cursor() as cur_dev:
+            if disable_fks and not dry_run:
+                cur_dev.execute("SET session_replication_role = replica")
+                tprint("[DEV] FKs/Triggers desativados temporariamente")
+
+            for item in tabelas_conf:
+                tabela_origem = item["tabela"]
+                mapa_entry = mapa_tabelas.get(tabela_origem)
+                tabela_destino = mapa_entry["destino"] if mapa_entry else tabela_origem
+                arquivo_parquet = caminho_parquet_tabela(parquet_dir, tabela_origem)
+
+                resultado = {
+                    "tabela_origem": tabela_origem,
+                    "tabela_destino": tabela_destino,
+                    "lidos": 0,
+                    "inseridos": 0,
+                    "ignorados": 0,
+                    "erro": None,
+                }
+
+                try:
+                    if not arquivo_parquet.exists():
+                        tprint(f"[{tabela_origem}] parquet nao encontrado: {arquivo_parquet.name}")
+                        resultados.append(resultado)
+                        continue
+
+                    df = pd.read_parquet(arquivo_parquet)
+                    resultado["lidos"] = len(df)
+
+                    if dry_run:
+                        tprint(
+                            f"[{tabela_origem}] DRY-RUN import: {resultado['lidos']} registro(s) "
+                            f"-> {tabela_destino}"
+                        )
+                        resultados.append(resultado)
+                        continue
+
+                    inseridos, ignorados = inserir_dataframe_em_tabela(
+                        cur_dev=cur_dev,
+                        tabela_destino=tabela_destino,
+                        df=df,
+                        batch_size=batch_size,
+                    )
+                    resultado["inseridos"] = inseridos
+                    resultado["ignorados"] = ignorados
+                    tprint(
+                        f"[{tabela_origem} -> {tabela_destino}] "
+                        f"lidos={resultado['lidos']} inseridos={inseridos} ignorados={ignorados}"
+                    )
+                except Exception as e:
+                    resultado["erro"] = str(e)
+                    tprint(f"[{tabela_origem}] ERRO import: {e}")
+
+                resultados.append(resultado)
+
+        if not dry_run:
+            conn_dev.commit()
+    except Exception:
+        conn_dev.rollback()
+        raise
+    finally:
+        if disable_fks and not dry_run and not conn_dev.closed:
+            try:
+                with conn_dev.cursor() as cur_dev:
+                    cur_dev.execute("SET session_replication_role = origin")
+                conn_dev.commit()
+                tprint("[DEV] FKs/Triggers reativados")
+            except Exception as e:
+                tprint(f"[DEV] AVISO: falha ao reativar FKs/Triggers: {e}")
+        conn_dev.close()
+
+    return resultados
+
+
+# =============================================================
+# RESUMOS
+# =============================================================
+def imprimir_resumo_export(resultados: list[dict]) -> None:
+    print(f"\n{'=' * 70}")
     print(f"{'Tabela':<30} {'Gravados':>10} {'Dedup':>10} {'Final':>10} {'Status':>8}")
-    print(f"{'â”€'*70}")
+    print(f"{'-' * 70}")
 
     total_gravados = 0
     total_final = 0
     total_dedup = 0
-    total_erros     = 0
+    total_erros = 0
     for r in sorted(resultados, key=lambda x: x["tabela"]):
-        status = "âœ– ERRO" if r["erro"] else "âœ” OK"
+        status = "ERRO" if r["erro"] else "OK"
         print(
             f"{r['tabela']:<30} {r['gravados']:>10} "
             f"{r['deduplicados']:>10} {r['apos_dedup']:>10} {status:>8}"
@@ -578,14 +473,121 @@ def main():
         total_final += r["apos_dedup"]
         if r["erro"]:
             total_erros += 1
-            print(f"  â”” {r['erro']}")
+            print(f"  -> {r['erro']}")
 
-    print(f"{'â•'*70}")
+    print(f"{'=' * 70}")
     print(f"Total gravado     : {total_gravados}")
     print(f"Total deduplicado : {total_dedup}")
     print(f"Total final       : {total_final}")
-    print(f"Tabelas com erro: {total_erros}")
-    print("ConcluÃ­do âœ…" if total_erros == 0 else "ConcluÃ­do com erros âš ï¸")
+    print(f"Tabelas com erro  : {total_erros}")
+
+
+def imprimir_resumo_import(resultados: list[dict]) -> None:
+    print(f"\n{'=' * 90}")
+    print(f"{'Tabela origem':<30} {'Destino':<25} {'Lidos':>10} {'Inseridos':>10} {'Ignorados':>10} {'Status':>8}")
+    print(f"{'-' * 90}")
+
+    total_lidos = 0
+    total_inseridos = 0
+    total_ignorados = 0
+    total_erros = 0
+
+    for r in resultados:
+        status = "ERRO" if r["erro"] else "OK"
+        print(
+            f"{r['tabela_origem']:<30} {r['tabela_destino']:<25} {r['lidos']:>10} "
+            f"{r['inseridos']:>10} {r['ignorados']:>10} {status:>8}"
+        )
+        total_lidos += r["lidos"]
+        total_inseridos += r["inseridos"]
+        total_ignorados += r["ignorados"]
+        if r["erro"]:
+            total_erros += 1
+            print(f"  -> {r['erro']}")
+
+    print(f"{'=' * 90}")
+    print(f"Total lido       : {total_lidos}")
+    print(f"Total inserido   : {total_inseridos}")
+    print(f"Total ignorado   : {total_ignorados}")
+    print(f"Tabelas com erro : {total_erros}")
+
+
+# =============================================================
+# MAIN
+# =============================================================
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Exporta/importa dados via Parquet")
+    default_config = Path(__file__).parent / "tabelas.conf"
+    parser.add_argument("--config", default=str(default_config))
+    parser.add_argument("--dry-run", action="store_true", help="Simula sem gravar arquivo nem inserir no banco")
+    parser.add_argument("--import-parquet", action="store_true", help="Compatibilidade: executa apenas importacao")
+    parser.add_argument("--only-export", action="store_true", help="Executa somente a etapa de exportacao")
+    parser.add_argument("--only-import", action="store_true", help="Executa somente a etapa de importacao")
+    parser.add_argument(
+        "--disable-fks",
+        dest="disable_fks",
+        action="store_true",
+        default=True,
+        help="Importacao: desativa FKs/Triggers temporariamente (padrao: ativo)",
+    )
+    parser.add_argument(
+        "--enable-fks",
+        dest="disable_fks",
+        action="store_false",
+        help="Importacao: mantem FKs/Triggers ativos durante a carga",
+    )
+    parser.add_argument("--workers", type=int_positivo, default=None, help=f"Numero de tabelas em paralelo (padrao: {MAX_WORKERS})")
+    parser.add_argument("--batch-size", type=int_positivo, default=BATCH_SIZE, help=f"Tamanho do lote (padrao: {BATCH_SIZE})")
+    args = parser.parse_args()
+
+    tabelas_conf, mapa_tabelas, workers_conf = ler_config(Path(args.config))
+    workers_base = args.workers if args.workers is not None else (workers_conf or MAX_WORKERS)
+    workers = min(workers_base, len(tabelas_conf))
+
+    parquet_dir = diretorio_base_parquet()
+    print(f"Config: {len(tabelas_conf)} tabela(s) | workers={workers} | batch={args.batch_size}")
+    print(f"Parquet dir: {parquet_dir}")
+    if args.only_export and (args.only_import or args.import_parquet):
+        raise ValueError("Use apenas um entre --only-export e --only-import/--import-parquet")
+    if args.only_import and args.import_parquet:
+        raise ValueError("Use apenas um entre --only-import e --import-parquet")
+
+    # Padrao: sempre exporta e depois importa.
+    run_export = True
+    run_import = True
+    if args.only_export:
+        run_import = False
+    if args.only_import or args.import_parquet:
+        run_export = False
+
+    if run_export:
+        if args.dry_run:
+            print("*** MODO DRY-RUN EXPORT ***")
+
+        resultados_export = executar_exportacao(
+            tabelas_conf=tabelas_conf,
+            workers=workers,
+            dry_run=args.dry_run,
+            parquet_dir=parquet_dir,
+        )
+        imprimir_resumo_export(resultados_export)
+
+    if run_import:
+        if args.dry_run:
+            print("*** MODO DRY-RUN IMPORT ***")
+        if args.disable_fks:
+            print("*** Import com FKs/Triggers temporariamente desativados ***")
+
+        resultados_import = importar_parquets_para_dev(
+            tabelas_conf=tabelas_conf,
+            mapa_tabelas=mapa_tabelas,
+            parquet_dir=parquet_dir,
+            dry_run=args.dry_run,
+            batch_size=args.batch_size,
+            disable_fks=args.disable_fks,
+        )
+        imprimir_resumo_import(resultados_import)
+
 
 if __name__ == "__main__":
     main()

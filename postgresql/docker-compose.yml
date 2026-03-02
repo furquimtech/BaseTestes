@@ -38,6 +38,7 @@ services:
       - ../base_testes_schema.py:/scripts/base_testes_schema.py
       - ../base_testes_replicar_dados_semcopy.py:/scripts/base_testes_replicar_dados_semcopy.py
       - ../base_testes_replicar_dados_comcopy.py:/scripts/base_testes_replicar_dados_comcopy.py
+      - ../base_testes_replicar_dados_parquet.py:/scripts/base_testes_replicar_dados_parquet.py
       - ../replica.py:/scripts/replica.py
       - ../gerar_conf.py:/scripts/gerar_conf.py
 

@@ -11,8 +11,9 @@ RUN apt-get update \
         --trusted-host pypi.python.org \
         --trusted-host files.pythonhosted.org \
         psycopg2-binary \
+        pandas \
+        pyarrow \
         tqdm \
-        python-dotenv \
         python-dotenv \
     && rm -rf /var/lib/apt/lists/*
 
