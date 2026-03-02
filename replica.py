@@ -21,7 +21,7 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).parent
 
 SCHEMA  = SCRIPTS_DIR / "base_testes_schema.py"
-DADOS   = SCRIPTS_DIR / "base_testes_replicar_dados_semcopy.py"
+DADOS   = SCRIPTS_DIR / "base_testes_replicar_dados_parquet.py"
 
 def separador(titulo: str) -> None:
     print(f"\n{'═'*60}")

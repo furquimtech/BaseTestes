@@ -20,6 +20,8 @@ import os
 import argparse
 import datetime as dt
 import threading
+import hashlib
+import random
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
@@ -83,25 +85,126 @@ def tprint(msg: str) -> None:
     with _print_lock:
         tqdm.write(msg)
 
-def mascarar_nome(valor):
+def _mascarar_palavra(palavra: str) -> str:
+    if len(palavra) == 1:
+        return "*"
+    if len(palavra) == 2:
+        return palavra[0] + "*"
+    return palavra[0] + ("*" * (len(palavra) - 2)) + palavra[-1]
+
+def mascarar_nome(valor, manter_primeira_palavra: bool = False):
     if valor is None or not isinstance(valor, str):
         return valor
 
-    def _mascara_palavra(match: re.Match) -> str:
-        palavra = match.group(0)
-        if len(palavra) == 1:
-            return "*"
-        if len(palavra) == 2:
-            return palavra[0] + "*"
-        return palavra[0] + ("*" * (len(palavra) - 2)) + palavra[-1]
+    if not manter_primeira_palavra:
+        return re.sub(r"[A-Za-zÀ-ÿ]+", lambda m: _mascarar_palavra(m.group(0)), valor)
 
-    return re.sub(r"[A-Za-zÀ-ÿ]+", _mascara_palavra, valor)
+    partes = re.split(r"(\s+)", valor)
+    primeira_encontrada = False
+    resultado = []
+    for parte in partes:
+        if not parte or parte.isspace():
+            resultado.append(parte)
+            continue
+        if re.search(r"[A-Za-zÀ-ÿ]", parte):
+            if not primeira_encontrada:
+                resultado.append(parte)
+                primeira_encontrada = True
+            else:
+                resultado.append(re.sub(r"[A-Za-zÀ-ÿ]+", lambda m: _mascarar_palavra(m.group(0)), parte))
+        else:
+            resultado.append(parte)
+    return "".join(resultado)
 
 def mascarar_documento(valor):
     if valor is None:
         return valor
     texto = str(valor)
     return "".join("0" if ch.isdigit() else "X" if ch.isalpha() else ch for ch in texto)
+
+def _cpf_dv(cpf9: str) -> str:
+    nums = [int(c) for c in cpf9]
+    soma1 = sum(n * w for n, w in zip(nums, range(10, 1, -1)))
+    d1 = (soma1 * 10) % 11
+    d1 = 0 if d1 == 10 else d1
+
+    soma2 = sum(n * w for n, w in zip(nums + [d1], range(11, 1, -1)))
+    d2 = (soma2 * 10) % 11
+    d2 = 0 if d2 == 10 else d2
+    return f"{d1}{d2}"
+
+def mascarar_cpf(valor):
+    if valor is None:
+        return valor
+
+    # Evita quebrar colunas boolean/bit que por acaso contenham "cpf" no nome.
+    if isinstance(valor, bool):
+        return valor
+
+    original = str(valor).strip()
+    if not original:
+        return valor
+
+    digitos = re.sub(r"\D", "", original)
+    if len(digitos) != 11:
+        return valor
+
+    # CPF determinístico por hash para evitar "000...".
+    h = hashlib.sha256(digitos.encode("utf-8")).hexdigest()
+    base9 = str(int(h[:16], 16) % 1_000_000_000).zfill(9)
+    cpf = base9 + _cpf_dv(base9)
+
+    if re.fullmatch(r"\d{3}\.\d{3}\.\d{3}-\d{2}", original):
+        return f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+    return cpf
+
+def mascarar_rg(valor):
+    if valor is None:
+        return valor
+    if isinstance(valor, bool):
+        return valor
+
+    original = str(valor)
+    if not original.strip():
+        return valor
+
+    alnum = re.sub(r"[^0-9A-Za-z]", "", original).upper()
+    if len(alnum) < 5:
+        return valor
+
+    h = hashlib.sha256(alnum.encode("utf-8")).hexdigest()
+    base_num = int(h, 16)
+
+    chars = []
+    for i, ch in enumerate(original):
+        if ch.isdigit():
+            chars.append(str((base_num >> (i % 64)) % 10))
+        elif ch.isalpha():
+            chars.append(chr(ord("A") + ((base_num >> (i % 64)) % 26)))
+        else:
+            chars.append(ch)
+    return "".join(chars)
+
+def mascarar_telefone(valor):
+    if valor is None:
+        return valor
+    if isinstance(valor, bool):
+        return valor
+
+    original = str(valor)
+    if not original.strip():
+        return valor
+
+    rng = random.SystemRandom()
+    chars = []
+    for ch in original:
+        if ch.isdigit():
+            chars.append(str(rng.randrange(10)))
+        elif ch.isalpha():
+            chars.append(chr(ord("A") + rng.randrange(26)))
+        else:
+            chars.append(ch)
+    return "".join(chars)
 
 def coluna_parece_rg(coluna: str) -> bool:
     c = coluna.lower()
@@ -117,13 +220,23 @@ def mascarar_registro_sensivel(registro: dict) -> dict:
     for coluna, valor in mascarado.items():
         c = coluna.lower()
         if "cpf" in c:
-            mascarado[coluna] = mascarar_documento(valor)
+            mascarado[coluna] = mascarar_cpf(valor)
         elif coluna_parece_rg(c):
-            mascarado[coluna] = mascarar_documento(valor)
+            mascarado[coluna] = mascarar_rg(valor)
         elif "logradouro" in c:
             mascarado[coluna] = mascarar_nome(valor)
+        elif "endereco" in c:
+            mascarado[coluna] = mascarar_nome(valor, manter_primeira_palavra=True)
+        elif "telefone" in c:
+            mascarado[coluna] = mascarar_telefone(valor)
+        elif "avalista" in c:
+            mascarado[coluna] = mascarar_nome(valor, manter_primeira_palavra=True)
+        elif "mae" in c or "mãe" in c:
+            mascarado[coluna] = mascarar_nome(valor, manter_primeira_palavra=True)
+        elif "pai" in c:
+            mascarado[coluna] = mascarar_nome(valor, manter_primeira_palavra=True)
         elif "nome" in c:
-            mascarado[coluna] = mascarar_nome(valor)
+            mascarado[coluna] = mascarar_nome(valor, manter_primeira_palavra=True)
     return mascarado
 
 def int_positivo(valor: str) -> int:
@@ -257,6 +370,14 @@ def colunas_de(cur, tabela: str) -> list[str]:
             cols.append(r[0])
     return cols
 
+def definir_validacao_fks(cur_dev, habilitar: bool) -> None:
+    """
+    Desativa/reativa validação de FKs na sessão atual do PostgreSQL.
+    Usa session_replication_role para permitir carga sem bloqueio por FK.
+    """
+    papel = "origin" if habilitar else "replica"
+    cur_dev.execute(sql.SQL("SET session_replication_role = {}").format(sql.SQL(papel)))
+
 def pk_real_de(cur, tabela: str, cache_pk: dict, cache_colunas: dict) -> str | None:
     if tabela in cache_pk:
         return cache_pk[tabela]
@@ -304,9 +425,8 @@ def buscar_registros(cur, tabela: str, coluna_data: str | None,
         query += sql.SQL(" WHERE {} >= %s").format(sql.Identifier(coluna_data))
         params.append(cutoff)
 
-    pk = pk_real_de(cur, tabela, cache_pk, cache_colunas)
-    if pk:
-        query += sql.SQL(" ORDER BY {} DESC").format(sql.Identifier(pk))
+    # Ordena por coluna interna da tabela para refletir sequência física de gravação.
+    query += sql.SQL(" ORDER BY ctid DESC")
 
     if limit is not None:
         query += sql.SQL(" LIMIT %s")
@@ -500,55 +620,60 @@ def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm,
                 conn_prod.cursor(cursor_factory=RealDictCursor) as cur_prod,
                 conn_dev.cursor()                               as cur_dev,
             ):
-                if not tabela_existe(cur_prod, tabela):
-                    tprint(f"[AVISO] {tabela}: não existe em produção, pulando.")
-                    return resultado
+                # Desconsidera FKs temporariamente durante a carga deste worker
+                definir_validacao_fks(cur_dev, habilitar=False)
+                try:
+                    if not tabela_existe(cur_prod, tabela):
+                        tprint(f"[AVISO] {tabela}: não existe em produção, pulando.")
+                        return resultado
 
-                cache_colunas: dict[str, list[str]] = {}      # local por worker
-                cache_dependencias: dict[str, list[tuple[str, str]]] = {}
-                cache_tabela_existe: dict[str, bool] = {}
-                cache_colunas_dev: dict[str, list[str]] = {}
-                cache_pk_prod: dict[str, str | None] = {}
-                cache_pk_dev: dict[str, str | None] = {}
+                    cache_colunas: dict[str, list[str]] = {}      # local por worker
+                    cache_dependencias: dict[str, list[tuple[str, str]]] = {}
+                    cache_tabela_existe: dict[str, bool] = {}
+                    cache_colunas_dev: dict[str, list[str]] = {}
+                    cache_pk_prod: dict[str, str | None] = {}
+                    cache_pk_dev: dict[str, str | None] = {}
 
-                registros = buscar_registros(
-                    cur_prod, tabela, coluna_data, dias, limit, cache_pk_prod, cache_colunas
-                )
-                tprint(f"\n{'─'*60}")
-                tprint(f"[{tabela}] {filtro_str} | {len(registros)} registro(s)")
-                ja_inseridos:  set[tuple[str, str]] = set()   # local por worker
+                    registros = buscar_registros(
+                        cur_prod, tabela, coluna_data, dias, limit, cache_pk_prod, cache_colunas
+                    )
+                    tprint(f"\n{'─'*60}")
+                    tprint(f"[{tabela}] {filtro_str} | {len(registros)} registro(s)")
+                    ja_inseridos:  set[tuple[str, str]] = set()   # local por worker
 
-                inseridos = 0
-                ignorados = 0
-                erros     = 0
+                    inseridos = 0
+                    ignorados = 0
+                    erros     = 0
 
-                for i, reg in enumerate(registros):
-                    antes = len(ja_inseridos)
-                    inserir_com_deps(cur_prod, cur_dev, tabela, reg,
-                                     ja_inseridos, cache_colunas, cache_dependencias,
-                                     cache_tabela_existe, dry_run, mapa_tabelas,
-                                     cache_pk_prod, cache_pk_dev, cache_colunas_dev)
+                    for i, reg in enumerate(registros):
+                        antes = len(ja_inseridos)
+                        inserir_com_deps(cur_prod, cur_dev, tabela, reg,
+                                         ja_inseridos, cache_colunas, cache_dependencias,
+                                         cache_tabela_existe, dry_run, mapa_tabelas,
+                                         cache_pk_prod, cache_pk_dev, cache_colunas_dev)
 
-                    novos = len(ja_inseridos) - antes
-                    if novos > 0:
-                        inseridos += novos
-                    else:
-                        ignorados += 1
+                        novos = len(ja_inseridos) - antes
+                        if novos > 0:
+                            inseridos += novos
+                        else:
+                            ignorados += 1
 
-                    # Commit a cada batch_size registros
-                    if not dry_run and (i + 1) % batch_size == 0:
+                        # Commit a cada batch_size registros
+                        if not dry_run and (i + 1) % batch_size == 0:
+                            conn_dev.commit()
+
+                        pbar_total.update(1)
+
+                    # Commit do restante
+                    if not dry_run:
                         conn_dev.commit()
 
-                    pbar_total.update(1)
-
-                # Commit do restante
-                if not dry_run:
-                    conn_dev.commit()
-
-                resultado["inseridos"] = inseridos
-                resultado["ignorados"] = ignorados
-                resultado["erros"]     = erros
-                tprint(f"[{tabela}] ✔ {inseridos} inserido(s), {ignorados} já existia(m), {erros} erro(s) ignorado(s)")
+                    resultado["inseridos"] = inseridos
+                    resultado["ignorados"] = ignorados
+                    resultado["erros"]     = erros
+                    tprint(f"[{tabela}] ✔ {inseridos} inserido(s), {ignorados} já existia(m), {erros} erro(s) ignorado(s)")
+                finally:
+                    definir_validacao_fks(cur_dev, habilitar=True)
 
     except Exception as e:
         resultado["erro"] = str(e)

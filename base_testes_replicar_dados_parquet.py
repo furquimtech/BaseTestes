@@ -8,6 +8,7 @@ deduplica por PK e tambem suporta importar esses parquets para o banco DEV.
 import argparse
 import datetime as dt
 import os
+import random
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -115,6 +116,60 @@ def adaptar_valor_pg(valor):
         except Exception:
             return valor
     return valor
+
+
+def _is_na(valor) -> bool:
+    try:
+        return bool(pd.isna(valor))
+    except Exception:
+        return False
+
+
+def mascarar_nome(valor):
+    if _is_na(valor) or not isinstance(valor, str):
+        return valor
+
+    def _mascara_palavra(match: re.Match) -> str:
+        palavra = match.group(0)
+        if len(palavra) == 1:
+            return "*"
+        if len(palavra) == 2:
+            return palavra[0] + "*"
+        return palavra[0] + ("*" * (len(palavra) - 2)) + palavra[-1]
+
+    return re.sub(r"[A-Za-zÀ-ÿ]+", _mascara_palavra, valor)
+
+
+def mascarar_documento(valor):
+    if _is_na(valor):
+        return valor
+    texto = str(valor)
+    return "".join(str(random.randint(0, 9)) for _ in texto)
+
+
+def coluna_parece_rg(coluna: str) -> bool:
+    c = coluna.lower()
+    return bool(
+        c.startswith("rg")
+        or c.endswith("_rg")
+        or "_rg_" in c
+        or re.search(r"(^|[^a-z0-9])rg([^a-z0-9]|$)", c)
+    )
+
+
+def aplicar_mascaras_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    df_mask = df.copy()
+    for coluna in df_mask.columns:
+        col = coluna.lower()
+        if "cpf" in col or coluna_parece_rg(col):
+            df_mask[coluna] = df_mask[coluna].map(mascarar_documento)
+        elif "logradouro" in col or "nome" in col:
+            df_mask[coluna] = df_mask[coluna].map(mascarar_nome)
+
+    return df_mask
 
 
 # =============================================================
@@ -232,6 +287,7 @@ def salvar_em_parquet(path_arquivo: Path, registros: list[dict]) -> int:
         return 0
 
     df = pd.DataFrame(registros)
+    df = aplicar_mascaras_dataframe(df)
     df.to_parquet(path_arquivo, index=False)
     return len(df)
 
