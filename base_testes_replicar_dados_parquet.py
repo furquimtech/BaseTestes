@@ -1,18 +1,15 @@
-"""
-replicar_dados_semcopy.py
--------------------------
-Conecta em produção, busca os registros configurados em tabelas.conf,
-resolve dependências e insere no banco dev usando INSERT ... ON CONFLICT
-(pk) DO NOTHING.
-
-Processa até MAX_WORKERS tabelas em paralelo — cada worker tem seu
-próprio par de conexões (prod + dev), garantindo thread safety.
+﻿"""
+base_testes_replicar_dados_parquet.py
+-------------------------------------
+Conecta em producao, busca os registros configurados em tabelas.conf,
+salva cada tabela em arquivo .parquet dentro de parquet/<nome_database>
+e executa deduplicacao por chave primaria da tabela.
 
 Uso:
-    python replicar_dados_semcopy.py
-    python replicar_dados_semcopy.py --config outro_arquivo.conf
-    python replicar_dados_semcopy.py --dry-run
-    python replicar_dados_semcopy.py --workers 3
+    python base_testes_replicar_dados_parquet.py
+    python base_testes_replicar_dados_parquet.py --config outro_arquivo.conf
+    python base_testes_replicar_dados_parquet.py --dry-run
+    python base_testes_replicar_dados_parquet.py --workers 3
 """
 
 import re
@@ -24,6 +21,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
+import pandas as pd
 import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
@@ -43,14 +41,14 @@ def _encontrar_env() -> Path:
         if p.exists():
             return p
     raise FileNotFoundError(
-        "Arquivo .env não encontrado. Crie-o a partir do .env.example:\n"
+        "Arquivo .env nÃ£o encontrado. Crie-o a partir do .env.example:\n"
         "  cp .env.example .env"
     )
 
 load_dotenv(_encontrar_env())
 
 # =============================================================
-# CONEXÕES
+# CONEXÃ•ES
 # =============================================================
 PROD = dict(
     host     = os.environ["PROD_HOST"],
@@ -72,16 +70,58 @@ SCHEMA      = "public"
 MAX_WORKERS = 5
 BATCH_SIZE  = 100
 
-# Tabelas que NÃO devem ser resolvidas como dependência
+# Tabelas que NÃƒO devem ser resolvidas como dependÃªncia
 DEPENDENCIA_IGNORAR: set[str] = set()
 
-# Lock para o tqdm (saída no terminal compartilhada entre threads)
+# Lock para o tqdm (saÃ­da no terminal compartilhada entre threads)
 _print_lock = threading.Lock()
 
 def tprint(msg: str) -> None:
     """tqdm.write thread-safe."""
     with _print_lock:
         tqdm.write(msg)
+
+def diretorio_base_parquet() -> Path:
+    """Cria e retorna parquet/<DEV_DB>."""
+    db_name = DEV["dbname"]
+    base_dir = Path(__file__).parent / "parquet" / db_name
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return base_dir
+
+def caminho_parquet_tabela(base_dir: Path, tabela: str) -> Path:
+    return base_dir / f"{tabela}.parquet"
+
+def salvar_em_parquet(path_arquivo: Path, registros: list[dict]) -> int:
+    if not registros:
+        if path_arquivo.exists():
+            path_arquivo.unlink()
+        return 0
+    df = pd.DataFrame(registros)
+    df.to_parquet(path_arquivo, index=False)
+    return len(df)
+
+def deduplicar_arquivo_parquet(path_arquivo: Path, tabela: str) -> tuple[int, int]:
+    """
+    Deduplica por chave primÃ¡ria da tabela, mantendo o primeiro registro.
+    Retorna (total_apos_dedup, removidos).
+    """
+    if not path_arquivo.exists():
+        return 0, 0
+
+    df = pd.read_parquet(path_arquivo)
+    if df.empty:
+        return 0, 0
+
+    coluna_pk = pk_de(tabela)
+    if coluna_pk not in df.columns:
+        return len(df), 0
+
+    total_antes = len(df)
+    df = df.drop_duplicates(subset=[coluna_pk], keep="first")
+    removidos = total_antes - len(df)
+    if removidos > 0:
+        df.to_parquet(path_arquivo, index=False)
+    return len(df), removidos
 
 def mascarar_nome(valor):
     if valor is None or not isinstance(valor, str):
@@ -95,7 +135,7 @@ def mascarar_nome(valor):
             return palavra[0] + "*"
         return palavra[0] + ("*" * (len(palavra) - 2)) + palavra[-1]
 
-    return re.sub(r"[A-Za-zÀ-ÿ]+", _mascara_palavra, valor)
+    return re.sub(r"[A-Za-zÃ€-Ã¿]+", _mascara_palavra, valor)
 
 def mascarar_documento(valor):
     if valor is None:
@@ -130,31 +170,31 @@ def int_positivo(valor: str) -> int:
     try:
         inteiro = int(valor)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"Valor inválido: {valor}") from exc
+        raise argparse.ArgumentTypeError(f"Valor invÃ¡lido: {valor}") from exc
     if inteiro <= 0:
         raise argparse.ArgumentTypeError(f"Valor deve ser > 0: {valor}")
     return inteiro
 
 # =============================================================
-# LEITURA DO ARQUIVO DE CONFIGURAÇÃO
+# LEITURA DO ARQUIVO DE CONFIGURAÃ‡ÃƒO
 # =============================================================
 def ler_config(path: Path) -> tuple[list[dict], dict, int | None]:
     """
-    Lê o tabelas.conf e retorna:
+    LÃª o tabelas.conf e retorna:
       - lista de itens de tabelas a replicar
-      - dicionário de mapeamento de tabelas herdadas { origem: {destino, pk} }
-      - número de workers definido via @workers (ou None se não configurado)
+      - dicionÃ¡rio de mapeamento de tabelas herdadas { origem: {destino, pk} }
+      - nÃºmero de workers definido via @workers (ou None se nÃ£o configurado)
 
     Formatos aceitos por linha:
         @workers | N                              -> define max workers
-        @mapa | origem | destino | pk (opcional) -> mapeamento de herança
+        @mapa | origem | destino | pk (opcional) -> mapeamento de heranÃ§a
         tabela
         tabela | coluna_data | dias
         tabela | coluna_data | dias | limit
         tabela | | | limit
     """
     if not path.exists():
-        raise FileNotFoundError(f"Arquivo de configuração não encontrado: {path}")
+        raise FileNotFoundError(f"Arquivo de configuraÃ§Ã£o nÃ£o encontrado: {path}")
 
     items   = []
     mapa    = {}
@@ -170,7 +210,7 @@ def ler_config(path: Path) -> tuple[list[dict], dict, int | None]:
         # @workers | N
         if partes[0] == "@workers":
             if len(partes) != 2:
-                raise ValueError(f"Linha {numero}: '@workers' requer '@workers | N' onde N é um número inteiro")
+                raise ValueError(f"Linha {numero}: '@workers' requer '@workers | N' onde N Ã© um nÃºmero inteiro")
             try:
                 workers = int(partes[1])
             except ValueError as exc:
@@ -188,11 +228,11 @@ def ler_config(path: Path) -> tuple[list[dict], dict, int | None]:
             pk      = partes[3] if len(partes) == 4 and partes[3] else None
             mapa[origem] = {"destino": destino, "pk": pk}
             pk_info = f" (pk: {pk})" if pk else ""
-            tprint(f"[MAPA] {origem} → {destino}{pk_info}")
+            tprint(f"[MAPA] {origem} â†’ {destino}{pk_info}")
             continue
 
         if len(partes) > 4:
-            raise ValueError(f"Linha {numero} inválida: '{linha}'")
+            raise ValueError(f"Linha {numero} invÃ¡lida: '{linha}'")
 
         while len(partes) < 4:
             partes.append("")
@@ -249,53 +289,10 @@ def colunas_de(cur, tabela: str) -> list[str]:
         WHERE table_schema = %s AND table_name = %s
         ORDER BY ordinal_position
     """, (SCHEMA, tabela))
-    cols = []
-    for r in cur.fetchall():
-        if isinstance(r, dict):
-            cols.append(r["column_name"])
-        else:
-            cols.append(r[0])
-    return cols
-
-def pk_real_de(cur, tabela: str, cache_pk: dict, cache_colunas: dict) -> str | None:
-    if tabela in cache_pk:
-        return cache_pk[tabela]
-
-    if tabela not in cache_colunas:
-        cache_colunas[tabela] = colunas_de(cur, tabela)
-
-    cols = cache_colunas[tabela]
-    pk_padrao = pk_de(tabela)
-    if pk_padrao in cols:
-        cache_pk[tabela] = pk_padrao
-        return pk_padrao
-
-    cur.execute("""
-        SELECT kcu.column_name
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name
-         AND tc.table_schema   = kcu.table_schema
-         AND tc.table_name     = kcu.table_name
-        WHERE tc.table_schema = %s
-          AND tc.table_name   = %s
-          AND tc.constraint_type = 'PRIMARY KEY'
-        ORDER BY kcu.ordinal_position
-        LIMIT 1
-    """, (SCHEMA, tabela))
-    row = cur.fetchone()
-
-    if row is not None:
-        pk = row["column_name"] if isinstance(row, dict) else row[0]
-        cache_pk[tabela] = pk
-        return pk
-
-    cache_pk[tabela] = None
-    return None
+    return [r["column_name"] for r in cur.fetchall()]
 
 def buscar_registros(cur, tabela: str, coluna_data: str | None,
-                     dias: int | None, limit: int | None,
-                     cache_pk: dict, cache_colunas: dict) -> list[dict]:
+                     dias: int | None, limit: int | None) -> list[dict]:
     query  = sql.SQL("SELECT * FROM {}").format(sql.Identifier(SCHEMA, tabela))
     params = []
 
@@ -304,9 +301,7 @@ def buscar_registros(cur, tabela: str, coluna_data: str | None,
         query += sql.SQL(" WHERE {} >= %s").format(sql.Identifier(coluna_data))
         params.append(cutoff)
 
-    pk = pk_real_de(cur, tabela, cache_pk, cache_colunas)
-    if pk:
-        query += sql.SQL(" ORDER BY {} DESC").format(sql.Identifier(pk))
+    query += sql.SQL(" ORDER BY {} DESC").format(sql.Identifier(pk_de(tabela)))
 
     if limit is not None:
         query += sql.SQL(" LIMIT %s")
@@ -315,10 +310,8 @@ def buscar_registros(cur, tabela: str, coluna_data: str | None,
     cur.execute(query, params)
     return cur.fetchall()
 
-def buscar_por_pk(cur, tabela: str, pk_valor, cache_pk: dict, cache_colunas: dict) -> dict | None:
-    pk = pk_real_de(cur, tabela, cache_pk, cache_colunas)
-    if not pk:
-        return None
+def buscar_por_pk(cur, tabela: str, pk_valor) -> dict | None:
+    pk = pk_de(tabela)
     query = sql.SQL("SELECT * FROM {} WHERE {} = %s").format(
         sql.Identifier(SCHEMA, tabela),
         sql.Identifier(pk),
@@ -327,13 +320,12 @@ def buscar_por_pk(cur, tabela: str, pk_valor, cache_pk: dict, cache_colunas: dic
     return cur.fetchone()
 
 def inserir_registro(cur_dev, tabela: str, registro: dict,
-                     dry_run: bool, mapa_tabelas: dict,
-                     cache_pk_dev: dict, cache_colunas_dev: dict) -> bool:
+                     dry_run: bool, mapa_tabelas: dict) -> bool:
     """
     INSERT com ON CONFLICT (pk) DO NOTHING.
     Se a tabela estiver no mapa_tabelas, redireciona o insert para a tabela destino
-    (ex: cbcontrato → cbcontratoeleva), usando a PK configurada se informada.
-    Usa SAVEPOINT para isolar erros sem derrubar a transação.
+    (ex: cbcontrato â†’ cbcontratoeleva), usando a PK configurada se informada.
+    Usa SAVEPOINT para isolar erros sem derrubar a transaÃ§Ã£o.
     """
     if dry_run:
         return True
@@ -341,12 +333,7 @@ def inserir_registro(cur_dev, tabela: str, registro: dict,
     # Redireciona para tabela herdada se houver mapeamento
     mapa_entry     = mapa_tabelas.get(tabela)
     tabela_destino = mapa_entry["destino"] if mapa_entry else tabela
-    pk             = mapa_entry["pk"] if mapa_entry and mapa_entry["pk"] else pk_real_de(
-        cur_dev, tabela_destino, cache_pk_dev, cache_colunas_dev
-    )
-    if not pk:
-        tprint(f"   [IGNORADO] {tabela}: PK não encontrada em {tabela_destino}.")
-        return False
+    pk             = mapa_entry["pk"] if mapa_entry and mapa_entry["pk"] else pk_de(tabela_destino)
     registro_mask  = mascarar_registro_sensivel(registro)
 
     colunas  = list(registro_mask.keys())
@@ -371,12 +358,12 @@ def inserir_registro(cur_dev, tabela: str, registro: dict,
     except Exception as e:
         cur_dev.execute("ROLLBACK TO SAVEPOINT insert_row")
         cur_dev.execute("RELEASE SAVEPOINT insert_row")
-        pk_val = registro.get(pk, "?")
+        pk_val = registro.get(pk_de(tabela), "?")
         tprint(f"   [IGNORADO] {tabela} pk={pk_val}: {e}")
         return False
 
 # =============================================================
-# RESOLUÇÃO DE DEPENDÊNCIAS
+# RESOLUÃ‡ÃƒO DE DEPENDÃŠNCIAS
 # =============================================================
 RE_COLUNA_DEP = re.compile(r"^id_([a-z0-9_]+)_int$", re.IGNORECASE)
 
@@ -416,29 +403,23 @@ def dependencias_de(
 def inserir_com_deps(cur_prod, cur_dev, tabela: str, registro: dict,
                      ja_inseridos: set, cache_colunas: dict,
                      cache_dependencias: dict, cache_tabela_existe: dict,
-                     dry_run: bool, mapa_tabelas: dict,
-                     cache_pk_prod: dict, cache_pk_dev: dict,
-                     cache_colunas_dev: dict) -> None:
+                     dry_run: bool, mapa_tabelas: dict) -> None:
     """
-    Insere registro e suas dependências recursivamente.
-    ja_inseridos é LOCAL a cada worker — não compartilhado entre threads.
-    ON CONFLICT DO NOTHING resolve colisões entre workers no banco.
+    Insere registro e suas dependÃªncias recursivamente.
+    ja_inseridos Ã© LOCAL a cada worker â€” nÃ£o compartilhado entre threads.
+    ON CONFLICT DO NOTHING resolve colisÃµes entre workers no banco.
     """
-    pk_col = pk_real_de(cur_prod, tabela, cache_pk_prod, cache_colunas)
-    if not pk_col:
-        return
-
-    pk_val = registro.get(pk_col)
+    pk_val = registro.get(pk_de(tabela))
     if pk_val is None:
         return
 
-    chave = (tabela, str(pk_val))
+    chave = (tabela, int(pk_val))
     if chave in ja_inseridos:
         return
 
     ja_inseridos.add(chave)
 
-    # 1) Resolve dependências primeiro
+    # 1) Resolve dependÃªncias primeiro
     for coluna_fk, tabela_dep in dependencias_de(
         cur_prod,
         tabela,
@@ -450,28 +431,27 @@ def inserir_com_deps(cur_prod, cur_dev, tabela: str, registro: dict,
         if id_dep is None:
             continue
 
-        registro_dep = buscar_por_pk(cur_prod, tabela_dep, id_dep, cache_pk_prod, cache_colunas)
+        registro_dep = buscar_por_pk(cur_prod, tabela_dep, id_dep)
         if registro_dep is None:
-            tprint(f"   [AVISO] {tabela}.{coluna_fk}={id_dep} → {tabela_dep} não encontrado, ignorando.")
+            tprint(f"   [AVISO] {tabela}.{coluna_fk}={id_dep} â†’ {tabela_dep} nÃ£o encontrado, ignorando.")
             continue
 
         inserir_com_deps(cur_prod, cur_dev, tabela_dep, registro_dep,
                          ja_inseridos, cache_colunas, cache_dependencias,
-                         cache_tabela_existe, dry_run, mapa_tabelas,
-                         cache_pk_prod, cache_pk_dev, cache_colunas_dev)
+                         cache_tabela_existe, dry_run, mapa_tabelas)
 
     # 2) Insere o registro atual
-    inserir_registro(cur_dev, tabela, registro, dry_run, mapa_tabelas, cache_pk_dev, cache_colunas_dev)
+    inserir_registro(cur_dev, tabela, registro, dry_run, mapa_tabelas)
 
 # =============================================================
-# WORKER — processa uma tabela por completo
+# WORKER â€” processa uma tabela por completo
 # =============================================================
 def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm,
-                     mapa_tabelas: dict, batch_size: int = BATCH_SIZE) -> dict:
+                     mapa_tabelas: dict, parquet_dir: Path,
+                     batch_size: int = BATCH_SIZE) -> dict:
     """
-    Executado em thread separada. Cria suas próprias conexões
-    prod e dev — psycopg2 não é thread-safe entre conexões.
-    Retorna dict com resultado: { tabela, inseridos, ignorados, erro }.
+    Executado em thread separada. Cria sua propria conexao com producao
+    e retorna o resultado da gravacao/deduplicacao.
     """
     tabela      = item["tabela"]
     coluna_data = item["coluna_data"]
@@ -485,74 +465,50 @@ def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm,
         filtro_desc.append(f"LIMIT {limit}")
     filtro_str = " | ".join(filtro_desc) if filtro_desc else "sem filtro"
 
-    resultado = {"tabela": tabela, "inseridos": 0, "ignorados": 0, "erros": 0, "erro": None}
+    resultado = {
+        "tabela": tabela,
+        "gravados": 0,
+        "apos_dedup": 0,
+        "deduplicados": 0,
+        "erro": None,
+    }
 
     try:
-        # Cada worker tem seu próprio par de conexões
-        with (
-            psycopg2.connect(**PROD) as conn_prod,
-            psycopg2.connect(**DEV)  as conn_dev,
-        ):
+        # Cada worker tem sua propria conexao com producao
+        with psycopg2.connect(**PROD) as conn_prod:
             conn_prod.autocommit = True
-            conn_dev.autocommit  = False
 
-            with (
-                conn_prod.cursor(cursor_factory=RealDictCursor) as cur_prod,
-                conn_dev.cursor()                               as cur_dev,
-            ):
+            with conn_prod.cursor(cursor_factory=RealDictCursor) as cur_prod:
                 if not tabela_existe(cur_prod, tabela):
-                    tprint(f"[AVISO] {tabela}: não existe em produção, pulando.")
+                    tprint(f"[AVISO] {tabela}: nÃ£o existe em produÃ§Ã£o, pulando.")
                     return resultado
 
-                cache_colunas: dict[str, list[str]] = {}      # local por worker
-                cache_dependencias: dict[str, list[tuple[str, str]]] = {}
-                cache_tabela_existe: dict[str, bool] = {}
-                cache_colunas_dev: dict[str, list[str]] = {}
-                cache_pk_prod: dict[str, str | None] = {}
-                cache_pk_dev: dict[str, str | None] = {}
-
-                registros = buscar_registros(
-                    cur_prod, tabela, coluna_data, dias, limit, cache_pk_prod, cache_colunas
-                )
-                tprint(f"\n{'─'*60}")
+                registros = buscar_registros(cur_prod, tabela, coluna_data, dias, limit)
+                tprint(f"\n{'â”€'*60}")
                 tprint(f"[{tabela}] {filtro_str} | {len(registros)} registro(s)")
-                ja_inseridos:  set[tuple[str, str]] = set()   # local por worker
 
-                inseridos = 0
-                ignorados = 0
-                erros     = 0
-
-                for i, reg in enumerate(registros):
-                    antes = len(ja_inseridos)
-                    inserir_com_deps(cur_prod, cur_dev, tabela, reg,
-                                     ja_inseridos, cache_colunas, cache_dependencias,
-                                     cache_tabela_existe, dry_run, mapa_tabelas,
-                                     cache_pk_prod, cache_pk_dev, cache_colunas_dev)
-
-                    novos = len(ja_inseridos) - antes
-                    if novos > 0:
-                        inseridos += novos
-                    else:
-                        ignorados += 1
-
-                    # Commit a cada batch_size registros
-                    if not dry_run and (i + 1) % batch_size == 0:
-                        conn_dev.commit()
-
+                for _ in registros:
                     pbar_total.update(1)
 
-                # Commit do restante
-                if not dry_run:
-                    conn_dev.commit()
+                if dry_run:
+                    tprint(f"[{tabela}] DRY-RUN: {len(registros)} registro(s) seriam gravados em parquet")
+                    return resultado
 
-                resultado["inseridos"] = inseridos
-                resultado["ignorados"] = ignorados
-                resultado["erros"]     = erros
-                tprint(f"[{tabela}] ✔ {inseridos} inserido(s), {ignorados} já existia(m), {erros} erro(s) ignorado(s)")
+                caminho_saida = caminho_parquet_tabela(parquet_dir, tabela)
+                gravados = salvar_em_parquet(caminho_saida, registros)
+                apos_dedup, removidos = deduplicar_arquivo_parquet(caminho_saida, tabela)
+
+                resultado["gravados"] = gravados
+                resultado["apos_dedup"] = apos_dedup
+                resultado["deduplicados"] = removidos
+                tprint(
+                    f"[{tabela}] âœ” parquet salvo em {caminho_saida.name} | "
+                    f"gravados={gravados}, deduplicados={removidos}, final={apos_dedup}"
+                )
 
     except Exception as e:
         resultado["erro"] = str(e)
-        tprint(f"[{tabela}] ✖ ERRO: {e}")
+        tprint(f"[{tabela}] âœ– ERRO: {e}")
 
     return resultado
 
@@ -560,38 +516,41 @@ def processar_tabela(item: dict, dry_run: bool, pbar_total: tqdm,
 # MAIN
 # =============================================================
 def main():
-    parser = argparse.ArgumentParser(description="Replica dados de produção para dev via INSERT paralelo.")
+    parser = argparse.ArgumentParser(description="Extrai dados de produÃ§Ã£o e salva em arquivos Parquet.")
     default_config = Path(__file__).parent / "tabelas.conf"
     parser.add_argument("--config",     default=str(default_config))
     parser.add_argument("--dry-run",    action="store_true",           help="Simula sem inserir nada")
-    parser.add_argument("--workers",    type=int_positivo, default=None, help=f"Nº de tabelas em paralelo (padrão: {MAX_WORKERS})")
-    parser.add_argument("--batch-size", type=int_positivo, default=BATCH_SIZE,  help=f"Commit a cada N registros (padrão: {BATCH_SIZE})")
+    parser.add_argument("--workers",    type=int_positivo, default=None, help=f"NÂº de tabelas em paralelo (padrÃ£o: {MAX_WORKERS})")
+    parser.add_argument("--batch-size", type=int_positivo, default=BATCH_SIZE,  help=f"Commit a cada N registros (padrÃ£o: {BATCH_SIZE})")
     args = parser.parse_args()
 
     if args.dry_run:
-        print("*** MODO DRY-RUN: nenhum dado será inserido ***\n")
+        print("*** MODO DRY-RUN: nenhum arquivo sera gravado ***\n")
 
     tabelas_conf, mapa_tabelas, workers_conf = ler_config(Path(args.config))
 
-    # Prioridade: --workers (CLI) > @workers (conf) > MAX_WORKERS (padrão)
+    # Prioridade: --workers (CLI) > @workers (conf) > MAX_WORKERS (padrÃ£o)
     workers_base = args.workers if args.workers is not None else (workers_conf or MAX_WORKERS)
     workers = min(workers_base, len(tabelas_conf))
 
-    print(f"Configuração: {len(tabelas_conf)} tabela(s) | {workers} worker(s) | batch {args.batch_size}")
+    parquet_dir = diretorio_base_parquet()
+
+    print(f"ConfiguraÃ§Ã£o: {len(tabelas_conf)} tabela(s) | {workers} worker(s) | batch {args.batch_size}")
+    print(f"DiretÃ³rio parquet: {parquet_dir}")
     if workers_conf:
         print(f"  (workers definido via @workers no conf)")
     if mapa_tabelas:
         print("Mapeamentos ativos:")
         for origem, entry in mapa_tabelas.items():
             pk_info = f" (pk: {entry['pk']})" if entry["pk"] else ""
-            print(f"  {origem} → {entry['destino']}{pk_info}")
+            print(f"  {origem} â†’ {entry['destino']}{pk_info}")
     print()
 
     with tqdm(desc="Registros processados", unit="reg", position=0) as pbar_total:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(processar_tabela, item, args.dry_run,
-                                pbar_total, mapa_tabelas, args.batch_size): item["tabela"]
+                    executor.submit(processar_tabela, item, args.dry_run,
+                                pbar_total, mapa_tabelas, parquet_dir, args.batch_size): item["tabela"]
                 for item in tabelas_conf
             }
 
@@ -600,25 +559,33 @@ def main():
                 resultados.append(future.result())
 
     # Resumo final
-    print(f"\n{'═'*70}")
-    print(f"{'Tabela':<30} {'Inseridos':>10} {'Ignorados':>10} {'Erros':>8} {'Status':>8}")
-    print(f"{'─'*70}")
+    print(f"\n{'â•'*70}")
+    print(f"{'Tabela':<30} {'Gravados':>10} {'Dedup':>10} {'Final':>10} {'Status':>8}")
+    print(f"{'â”€'*70}")
 
-    total_inseridos = 0
+    total_gravados = 0
+    total_final = 0
+    total_dedup = 0
     total_erros     = 0
     for r in sorted(resultados, key=lambda x: x["tabela"]):
-        status = "✖ ERRO" if r["erro"] else "✔ OK"
-        erros_insert = r.get("erros", 0)
-        print(f"{r['tabela']:<30} {r['inseridos']:>10} {r['ignorados']:>10} {erros_insert:>8} {status:>8}")
-        total_inseridos += r["inseridos"]
+        status = "âœ– ERRO" if r["erro"] else "âœ” OK"
+        print(
+            f"{r['tabela']:<30} {r['gravados']:>10} "
+            f"{r['deduplicados']:>10} {r['apos_dedup']:>10} {status:>8}"
+        )
+        total_gravados += r["gravados"]
+        total_dedup += r["deduplicados"]
+        total_final += r["apos_dedup"]
         if r["erro"]:
             total_erros += 1
-            print(f"  └ {r['erro']}")
+            print(f"  â”” {r['erro']}")
 
-    print(f"{'═'*70}")
-    print(f"Total inserido : {total_inseridos}")
+    print(f"{'â•'*70}")
+    print(f"Total gravado     : {total_gravados}")
+    print(f"Total deduplicado : {total_dedup}")
+    print(f"Total final       : {total_final}")
     print(f"Tabelas com erro: {total_erros}")
-    print("Concluído ✅" if total_erros == 0 else "Concluído com erros ⚠️")
+    print("ConcluÃ­do âœ…" if total_erros == 0 else "ConcluÃ­do com erros âš ï¸")
 
 if __name__ == "__main__":
     main()

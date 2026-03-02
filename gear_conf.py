@@ -61,11 +61,11 @@ SELECT
 FROM information_schema.tables
 WHERE table_type = 'BASE TABLE'
   AND table_schema NOT IN ('pg_catalog', 'information_schema')
-  AND (
+  /*AND (
         table_name LIKE 'ge%' OR
         table_name LIKE 'fi%' OR
         table_name LIKE 'cb%'
-      )
+      )*/
 ORDER BY table_schema, table_name;
 """
 

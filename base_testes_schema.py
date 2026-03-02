@@ -1,10 +1,14 @@
 import re
 import os
+import argparse
 import subprocess
 import platform
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
+
+import psycopg2
+from psycopg2 import sql
 
 # =========================
 # CARREGA CREDENCIAIS DO .env.scripts
@@ -42,7 +46,7 @@ PROD_PASS = os.environ["PROD_PASS"]
 # LOCAL/Dev (destino)
 LOCAL_HOST       = os.environ.get("DEV_HOST", "localhost")
 LOCAL_PORT       = int(os.environ.get("DEV_PORT", 5432))
-LOCAL_ADMIN_DB   = os.environ.get("DEV_LOCAL_DB", "postgres")
+LOCAL_ADMIN_DB   = os.environ.get("DEV_ADMIN_DB", "postgres")
 LOCAL_ADMIN_USER = os.environ["DEV_USER"]
 LOCAL_ADMIN_PASS = os.environ["DEV_PASS"]
 TARGET_DB        = os.environ["DEV_DB"]
@@ -112,6 +116,14 @@ def run_cmd(cmd: list[str], env: dict | None = None) -> None:
         )
 
 
+def quote_ident(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def quote_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def psql_exec(sql: str) -> None:
     """Executa SQL no LOCAL_ADMIN_DB (postgres)."""
     env = os.environ.copy()
@@ -141,7 +153,7 @@ def database_exists(dbname: str) -> bool:
         "-d", LOCAL_ADMIN_DB,
         "-t", "-A",
         "-v", "ON_ERROR_STOP=1",
-        "-c", f"SELECT 1 FROM pg_database WHERE datname = '{dbname}';",
+        "-c", f"SELECT 1 FROM pg_database WHERE datname = {quote_literal(dbname)};",
     ]
     p = subprocess.run(cmd, env=env, text=True, capture_output=True, encoding="utf-8", errors="replace")
     if p.returncode != 0:
@@ -153,15 +165,15 @@ def drop_database(dbname: str) -> None:
     terminate_sql = f"""
     SELECT pg_terminate_backend(pid)
     FROM pg_stat_activity
-    WHERE datname = '{dbname}'
+    WHERE datname = {quote_literal(dbname)}
       AND pid <> pg_backend_pid();
     """
     psql_exec(terminate_sql)
-    psql_exec(f'DROP DATABASE IF EXISTS "{dbname}";')
+    psql_exec(f"DROP DATABASE IF EXISTS {quote_ident(dbname)};")
 
 
 def create_database(dbname: str) -> None:
-    psql_exec(f'CREATE DATABASE "{dbname}";')
+    psql_exec(f"CREATE DATABASE {quote_ident(dbname)};")
     # Cria extensões necessárias no banco recém-criado
     psql_exec_on(dbname, 'CREATE EXTENSION IF NOT EXISTS dblink;')
     psql_exec_on(dbname, 'CREATE EXTENSION IF NOT EXISTS "uuid-ossp";')
@@ -184,8 +196,64 @@ def psql_exec_on(dbname: str, sql: str) -> None:
     run_cmd(cmd, env=env)
 
 
-def dump_schema_only() -> None:
-    """Gera dump SOMENTE do schema (sem CREATE DATABASE)."""
+
+def detectar_tabelas_sem_permissao() -> list[str]:
+    """
+    Conecta em produção via psycopg2 e testa SELECT 1 em cada tabela
+    do schema public. Retorna a lista de tabelas onde o usuário não
+    tem permissão de leitura.
+    """
+    print("Verificando permissões em produção...")
+
+    conn = psycopg2.connect(
+        host=PROD_HOST, port=PROD_PORT,
+        dbname=PROD_DB, user=PROD_USER, password=PROD_PASS,
+    )
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    # Lista todas as tabelas do schema public
+    cur.execute("""
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = 'public'
+        ORDER BY tablename
+    """)
+    todas = [row[0] for row in cur.fetchall()]
+
+    sem_permissao = []
+    for tabela in todas:
+        try:
+            cur.execute(
+                sql.SQL("SELECT 1 FROM public.{} LIMIT 1").format(sql.Identifier(tabela))
+            )
+        except psycopg2.errors.InsufficientPrivilege:
+            sem_permissao.append(tabela)
+            conn.rollback()  # limpa o estado de erro da conexão
+        except psycopg2.Error as exc:
+            conn.rollback()
+            raise RuntimeError(
+                f"Erro inesperado ao validar permissões da tabela public.{tabela}: {exc}"
+            ) from exc
+
+    cur.close()
+    conn.close()
+
+    if sem_permissao:
+        print(f"  ⚠️  {len(sem_permissao)} tabela(s) sem permissão — serão excluídas do dump:")
+        for t in sem_permissao:
+            print(f"     - {t}")
+    else:
+        print("  ✅ Permissão de leitura confirmada em todas as tabelas.")
+
+    return sem_permissao
+
+
+def dump_schema_only(excluir_tabelas: list[str] | None = None) -> None:
+    """
+    Gera dump SOMENTE do schema (sem CREATE DATABASE).
+    Tabelas em excluir_tabelas são passadas via --exclude-table ao pg_dump.
+    """
     env = os.environ.copy()
     env["PGPASSWORD"] = PROD_PASS
 
@@ -201,6 +269,11 @@ def dump_schema_only() -> None:
         "--verbose",
         "-f", str(DUMP_FILE),
     ]
+
+    # Exclui tabelas sem permissão para evitar erro de LOCK TABLE
+    for tabela in (excluir_tabelas or []):
+        cmd += ["--exclude-table", f"public.{tabela}"]
+
     run_cmd(cmd, env=env)
 
     # sanitize_dump_remove_extensions(DUMP_FILE, EXTENSIONS_TO_SKIP)
@@ -209,10 +282,16 @@ def dump_schema_only() -> None:
     print(f"OK: dump gerado em {DUMP_FILE}")
 
 
-def restore_schema_to_target_db() -> None:
-    """Restaura o schema conectando direto no TARGET_DB."""
+def restore_schema_to_target_db(excluir_tabelas: list[str] | None = None) -> None:
+    """
+    Restaura o schema conectando direto no TARGET_DB.
+    Quando houve exclusão de tabelas no dump, o restore roda sem ON_ERROR_STOP
+    para não interromper em objetos dependentes dessas tabelas.
+    """
     env = os.environ.copy()
     env["PGPASSWORD"] = LOCAL_ADMIN_PASS
+    modo_tolerante = bool(excluir_tabelas)
+    on_error_stop = "0" if modo_tolerante else "1"
 
     cmd = [
         PSQL,
@@ -220,14 +299,44 @@ def restore_schema_to_target_db() -> None:
         "-p", str(LOCAL_PORT),
         "-U", LOCAL_ADMIN_USER,
         "-d", TARGET_DB,
-        "-v", "ON_ERROR_STOP=1",
+        "-v", f"ON_ERROR_STOP={on_error_stop}",
         "-f", str(DUMP_FILE),
     ]
-    run_cmd(cmd, env=env)
+    p = subprocess.run(cmd, env=env, text=True, capture_output=True, encoding="utf-8", errors="replace")
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"Falha no comando:\n{' '.join(cmd)}\n\nSTDOUT:\n{p.stdout}\n\nSTDERR:\n{p.stderr}"
+        )
+    if modo_tolerante and "ERROR:" in p.stderr:
+        total_erros = p.stderr.count("ERROR:")
+        print(
+            f"AVISO: restore concluído com {total_erros} erro(s) de objetos "
+            "dependentes de tabelas excluídas por falta de permissão."
+        )
     print(f"OK: schema restaurado no DB {TARGET_DB}")
 
 
+def remove_dump_file() -> None:
+    if DUMP_FILE.exists():
+        DUMP_FILE.unlink()
+        print(f"OK: arquivo de dump removido: {DUMP_FILE}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Extrai schema de produção e restaura no banco local."
+    )
+    parser.add_argument(
+        "--keep-dump",
+        action="store_true",
+        help="Não remove o arquivo de dump ao final (padrão: remover).",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     # Valida se os binários existem antes de começar
     for bin_path in [PSQL, PG_DUMP]:
         if not Path(bin_path).exists():
@@ -244,10 +353,16 @@ def main():
     create_database(TARGET_DB)
 
     print("Extraindo schema da produção...")
-    dump_schema_only()
+    sem_permissao = detectar_tabelas_sem_permissao()
+    dump_schema_only(excluir_tabelas=sem_permissao)
 
     print("Restaurando schema no banco local...")
-    restore_schema_to_target_db()
+    restore_schema_to_target_db(excluir_tabelas=sem_permissao)
+
+    if args.keep_dump:
+        print(f"OK: mantendo arquivo de dump: {DUMP_FILE}")
+    else:
+        remove_dump_file()
 
     print("Concluído ✅")
 
