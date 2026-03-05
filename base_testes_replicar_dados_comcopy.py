@@ -77,6 +77,12 @@ def ler_config(path: Path) -> list[dict]:
             continue
 
         partes = [p.strip() for p in linha.split("|")]
+
+        # Compatibilidade com tabelas.conf usado no semcopy.
+        # Essas diretivas nao sao consumidas no comcopy, entao sao ignoradas.
+        if partes and partes[0] in {"@workers", "@mapa"}:
+            continue
+
         if len(partes) > 4:
             raise ValueError(f"Linha {numero} inválida: '{linha}'")
 
@@ -298,6 +304,7 @@ def gerar_sql(config_path: Path, sql_path: Path) -> int:
         f.write(f"-- Registros : {total}\n")
         f.write("-- =================================================\n\n")
         f.write("BEGIN;\n\n")
+        f.write("SET LOCAL session_replication_role = replica;\n\n")
 
         for tabela, registros_dict in buffer.items():
             registros = list(registros_dict.values())
@@ -305,6 +312,7 @@ def gerar_sql(config_path: Path, sql_path: Path) -> int:
             f.write(gerar_bloco_copy(tabela, colunas, registros))
             f.write("\n")
 
+        f.write("SET LOCAL session_replication_role = origin;\n")
         f.write("COMMIT;\n")
 
     tqdm.write(f"\n{'═'*60}")

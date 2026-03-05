@@ -8,7 +8,6 @@ deduplica por PK e tambem suporta importar esses parquets para o banco DEV.
 import argparse
 import datetime as dt
 import os
-import random
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +19,7 @@ from dotenv import load_dotenv
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor, execute_values
 from tqdm import tqdm
+from util import int_positivo, mascarar_registro_sensivel
 
 
 # =============================================================
@@ -95,16 +95,6 @@ def pk_de(tabela: str) -> str:
     return f"id_{tabela}_int"
 
 
-def int_positivo(valor: str) -> int:
-    try:
-        inteiro = int(valor)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"Valor invalido: {valor}") from exc
-    if inteiro <= 0:
-        raise argparse.ArgumentTypeError(f"Valor deve ser > 0: {valor}")
-    return inteiro
-
-
 def adaptar_valor_pg(valor):
     if pd.isna(valor):
         return None
@@ -118,58 +108,13 @@ def adaptar_valor_pg(valor):
     return valor
 
 
-def _is_na(valor) -> bool:
-    try:
-        return bool(pd.isna(valor))
-    except Exception:
-        return False
-
-
-def mascarar_nome(valor):
-    if _is_na(valor) or not isinstance(valor, str):
-        return valor
-
-    def _mascara_palavra(match: re.Match) -> str:
-        palavra = match.group(0)
-        if len(palavra) == 1:
-            return "*"
-        if len(palavra) == 2:
-            return palavra[0] + "*"
-        return palavra[0] + ("*" * (len(palavra) - 2)) + palavra[-1]
-
-    return re.sub(r"[A-Za-zÀ-ÿ]+", _mascara_palavra, valor)
-
-
-def mascarar_documento(valor):
-    if _is_na(valor):
-        return valor
-    texto = str(valor)
-    return "".join(str(random.randint(0, 9)) for _ in texto)
-
-
-def coluna_parece_rg(coluna: str) -> bool:
-    c = coluna.lower()
-    return bool(
-        c.startswith("rg")
-        or c.endswith("_rg")
-        or "_rg_" in c
-        or re.search(r"(^|[^a-z0-9])rg([^a-z0-9]|$)", c)
-    )
-
-
 def aplicar_mascaras_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df_mask = df.copy()
-    for coluna in df_mask.columns:
-        col = coluna.lower()
-        if "cpf" in col or coluna_parece_rg(col):
-            df_mask[coluna] = df_mask[coluna].map(mascarar_documento)
-        elif "logradouro" in col or "nome" in col:
-            df_mask[coluna] = df_mask[coluna].map(mascarar_nome)
-
-    return df_mask
+    registros = df.to_dict(orient="records")
+    registros_mask = [mascarar_registro_sensivel(r) for r in registros]
+    return pd.DataFrame(registros_mask, columns=df.columns)
 
 
 # =============================================================
