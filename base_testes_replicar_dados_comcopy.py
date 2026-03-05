@@ -1,228 +1,92 @@
 """
-replicar_dados.py
------------------
-Fase 1 - GERAR: Conecta em produção, busca os registros configurados em
-         tabelas.conf, resolve dependências e gera um arquivo .sql com
-         comandos COPY pronto para ser aplicado.
-
-Fase 2 - APLICAR: Executa o .sql gerado no banco dev via psql em uma
-         única transação.
-
-Uso:
-    python replicar_dados.py                   # gera e aplica
-    python replicar_dados.py --apenas-gerar    # só gera o .sql
-    python replicar_dados.py --apenas-aplicar  # aplica o último .sql gerado
-    python replicar_dados.py --dry-run         # gera o .sql mas não aplica
+base_testes_replicar_dados_comcopy.py
+-------------------------------------
+Fase 1 - GERAR: coleta dados de PROD e gera um .sql com blocos COPY.
+Fase 2 - APLICAR: executa o .sql no banco DEV via psql.
 """
 
-import re
-import os
-import subprocess
 import argparse
 import datetime as dt
+import os
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import psycopg2
+from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 from tqdm import tqdm
 
-# =============================================================
-# CONEXÕES
-# =============================================================
-PROD = dict(
-    host     = "10.80.91.30",
-    port     = 5432,
-    dbname   = "10.50.13.22_eleva",
-    user     = "mrfamos",
-    password = "Mikael1811!",
+from util import (
+    buscar_por_pk,
+    buscar_registros,
+    conexoes_env,
+    dependencias_de,
+    encontrar_env,
+    int_positivo,
+    ler_config_tabelas_e_workers,
+    pk_de,
+    qname,
+    tabela_existe,
 )
 
-DEV = dict(
-    host     = "localhost",
-    port     = 5432,
-    dbname   = "10.50.13.22_eleva_teste",
-    user     = "postgres",
-    password = "f5vcn32k",
-)
 
-PG_BIN = r"C:\Program Files\PostgreSQL\15\bin"
-PSQL   = str(Path(PG_BIN) / "psql.exe")
+load_dotenv(encontrar_env())
 
-SCHEMA = "public"
+PROD, DEV = conexoes_env()
+SCHEMA_DEFAULT = os.environ.get("DB_SCHEMA", "public")
+PG_BIN_DEFAULT = os.environ.get("PG_BIN", r"C:\Program Files\PostgreSQL\15\bin")
+PSQL_DEFAULT = str(Path(PG_BIN_DEFAULT) / "psql.exe")
+OUT_DIR_DEFAULT = Path(os.environ.get("OUT_DIR", str(Path(__file__).parent / "out")))
+MAX_WORKERS = 5
 
-# Tabelas que NÃO devem ser resolvidas como dependência
-DEPENDENCIA_IGNORAR: set[str] = set()
+# Tabelas que nao devem ser resolvidas como dependencia (env: "t1,t2,t3")
+DEPENDENCIA_IGNORAR_DEFAULT = {
+    t.strip().lower()
+    for t in os.environ.get("DEPENDENCIA_IGNORAR", "").split(",")
+    if t.strip()
+}
 
-# Pasta de saída dos arquivos .sql gerados
-OUT_DIR = Path("./out")
+_print_lock = threading.Lock()
 
-# =============================================================
-# LEITURA DO ARQUIVO DE CONFIGURAÇÃO
-# =============================================================
-def ler_config(path: Path) -> list[dict]:
-    """
-    Formatos aceitos por linha:
-        tabela
-        tabela | coluna_data | dias
-        tabela | coluna_data | dias | limit
-        tabela | | | limit
-    """
-    if not path.exists():
-        raise FileNotFoundError(f"Arquivo de configuração não encontrado: {path}")
 
-    items = []
-    for numero, linha in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        linha = linha.strip()
-        if not linha or linha.startswith("#"):
-            continue
+def tprint(msg: str) -> None:
+    with _print_lock:
+        tqdm.write(msg)
 
-        partes = [p.strip() for p in linha.split("|")]
 
-        # Compatibilidade com tabelas.conf usado no semcopy.
-        # Essas diretivas nao sao consumidas no comcopy, entao sao ignoradas.
-        if partes and partes[0] in {"@workers", "@mapa"}:
-            continue
-
-        if len(partes) > 4:
-            raise ValueError(f"Linha {numero} inválida: '{linha}'")
-
-        while len(partes) < 4:
-            partes.append("")
-
-        tabela, coluna_data, dias, limit = partes
-
-        if bool(coluna_data) != bool(dias):
-            raise ValueError(f"Linha {numero}: 'coluna_data' e 'dias' devem ser preenchidos juntos.")
-
-        dias_int  = int(dias)  if dias  else None
-        limit_int = int(limit) if limit else None
-
-        items.append({
-            "tabela":      tabela,
-            "coluna_data": coluna_data or None,
-            "dias":        dias_int,
-            "limit":       limit_int,
-        })
-
-    if not items:
-        raise ValueError(f"Nenhuma tabela configurada em {path}")
-
-    return items
-
-# =============================================================
-# HELPERS DE BANCO
-# =============================================================
-def qname(tabela: str) -> str:
-    return f"{SCHEMA}.{tabela}"
-
-def pk_de(tabela: str) -> str:
-    return f"id_{tabela}_int"
-
-def tabela_existe(cur, tabela: str) -> bool:
-    cur.execute("SELECT to_regclass(%s) AS oid", (qname(tabela),))
-    row = cur.fetchone()
-    return row is not None and row["oid"] is not None
-
-def colunas_de(cur, tabela: str) -> list[str]:
-    cur.execute("""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = %s
-        ORDER BY ordinal_position
-    """, (SCHEMA, tabela))
-    return [r["column_name"] for r in cur.fetchall()]
-
-def buscar_registros(cur, tabela: str, coluna_data: str | None,
-                     dias: int | None, limit: int | None) -> list[dict]:
-    sql    = f"SELECT * FROM {qname(tabela)}"
-    params = []
-
-    if coluna_data and dias is not None:
-        cutoff = dt.date.today() - dt.timedelta(days=dias)
-        sql   += f" WHERE {coluna_data} >= %s"
-        params.append(cutoff)
-
-    sql += f" ORDER BY {pk_de(tabela)} DESC"
-
-    if limit is not None:
-        sql += " LIMIT %s"
-        params.append(limit)
-
-    cur.execute(sql, params)
-    return cur.fetchall()
-
-def buscar_por_pk(cur, tabela: str, pk_valor) -> dict | None:
-    pk = pk_de(tabela)
-    cur.execute(f"SELECT * FROM {qname(tabela)} WHERE {pk} = %s", (pk_valor,))
-    return cur.fetchone()
-
-# =============================================================
-# RESOLUÇÃO DE DEPENDÊNCIAS
-# =============================================================
-RE_COLUNA_DEP = re.compile(r"^id_([a-z0-9]+)_int$", re.IGNORECASE)
-
-def dependencias_de(cur_prod, tabela: str, cache_colunas: dict) -> list[tuple[str, str]]:
-    if tabela not in cache_colunas:
-        cache_colunas[tabela] = colunas_de(cur_prod, tabela)
-
-    deps = []
-    for col in cache_colunas[tabela]:
-        match = RE_COLUNA_DEP.match(col)
-        if not match:
-            continue
-
-        tabela_ref = match.group(1).lower()
-
-        if tabela_ref == tabela.lower():
-            continue
-        if tabela_ref in DEPENDENCIA_IGNORAR:
-            continue
-        if tabela_existe(cur_prod, tabela_ref):
-            deps.append((col, tabela_ref))
-
-    return deps
-
-# =============================================================
-# COLETA E GERAÇÃO DO .SQL
-# =============================================================
 def valor_para_copy(v) -> str:
-    """Converte valor Python para o formato texto do COPY."""
     if v is None:
         return r"\N"
     if isinstance(v, bool):
         return "t" if v else "f"
     if isinstance(v, (dt.date, dt.datetime)):
         return v.isoformat()
-    return (
-        str(v)
-        .replace("\\", "\\\\")
-        .replace("\t", "\\t")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-    )
+    return str(v).replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
 
-def gerar_bloco_copy(tabela: str, colunas: list[str], registros: list[dict]) -> str:
-    """Gera bloco COPY ... FROM stdin com os registros."""
+
+def gerar_bloco_copy(schema: str, tabela: str, colunas: list[str], registros: list[dict]) -> str:
     cols_sql = ", ".join(colunas)
-    linhas   = [
-        "\t".join(valor_para_copy(reg.get(c)) for c in colunas)
-        for reg in registros
-    ]
+    linhas = ["\t".join(valor_para_copy(reg.get(c)) for c in colunas) for reg in registros]
     return (
         f"-- {tabela}: {len(registros)} registro(s)\n"
-        f"COPY {qname(tabela)} ({cols_sql}) FROM stdin;\n"
+        f"COPY {qname(schema, tabela)} ({cols_sql}) FROM stdin;\n"
         + "\n".join(linhas)
         + "\n\\.\n"
     )
 
-def coletar_com_deps(cur_prod, tabela: str, registro: dict,
-                     ja_coletados: set, cache_colunas: dict,
-                     buffer: dict) -> None:
-    """
-    Coleta registro e todas as suas dependências no buffer.
-    O buffer é indexado por (tabela, pk_val) garantindo que
-    nenhum registro seja escrito duas vezes no .sql.
-    """
+
+def coletar_com_deps(
+    cur_prod,
+    schema: str,
+    tabela: str,
+    registro: dict,
+    ja_coletados: set,
+    cache_colunas: dict,
+    buffer: dict,
+    dependencia_ignorar: set[str],
+) -> None:
     pk_val = registro.get(pk_de(tabela))
     if pk_val is None:
         return
@@ -233,67 +97,130 @@ def coletar_com_deps(cur_prod, tabela: str, registro: dict,
 
     ja_coletados.add(chave)
 
-    # 1) Coleta dependências primeiro (recursivo)
-    for coluna_fk, tabela_dep in dependencias_de(cur_prod, tabela, cache_colunas):
+    for coluna_fk, tabela_dep in dependencias_de(
+        cur_prod,
+        schema=schema,
+        tabela=tabela,
+        cache_colunas=cache_colunas,
+        dependencia_ignorar=dependencia_ignorar,
+    ):
         id_dep = registro.get(coluna_fk)
         if id_dep is None:
             continue
 
-        registro_dep = buscar_por_pk(cur_prod, tabela_dep, id_dep)
+        registro_dep = buscar_por_pk(cur_prod, schema=schema, tabela=tabela_dep, pk_valor=id_dep)
         if registro_dep is None:
-            tqdm.write(f"   [AVISO] {tabela}.{coluna_fk}={id_dep} → {tabela_dep} não encontrado, ignorando.")
+            tprint(f"   [AVISO] {tabela}.{coluna_fk}={id_dep} -> {tabela_dep} nao encontrado, ignorando.")
             continue
 
-        coletar_com_deps(cur_prod, tabela_dep, registro_dep,
-                         ja_coletados, cache_colunas, buffer)
+        coletar_com_deps(
+            cur_prod=cur_prod,
+            schema=schema,
+            tabela=tabela_dep,
+            registro=registro_dep,
+            ja_coletados=ja_coletados,
+            cache_colunas=cache_colunas,
+            buffer=buffer,
+            dependencia_ignorar=dependencia_ignorar,
+        )
 
-    # 2) Adiciona ao buffer indexado por pk — garante unicidade no .sql
-    # buffer = { tabela: { pk_val: registro } }
     buffer.setdefault(tabela, {})[int(pk_val)] = registro
 
-def gerar_sql(config_path: Path, sql_path: Path) -> int:
-    """Fase 1: coleta dados de produção e gera o .sql."""
-    tabelas_conf  = ler_config(config_path)
-    buffer:        dict[str, list[dict]] = {}
-    ja_coletados:  set[tuple[str, int]]  = set()
-    cache_colunas: dict[str, list[str]]  = {}
 
-    with psycopg2.connect(**PROD) as conn_prod:
-        conn_prod.autocommit = True
+def processar_tabela(item: dict, schema: str, dependencia_ignorar: set[str]) -> dict:
+    tabela = item["tabela"]
+    coluna_data = item["coluna_data"]
+    dias = item["dias"]
+    limit = item["limit"]
 
-        with conn_prod.cursor(cursor_factory=RealDictCursor) as cur_prod:
-            for item in tqdm(tabelas_conf, desc="Coletando tabelas", unit="tabela", position=0):
-                tabela      = item["tabela"]
-                coluna_data = item["coluna_data"]
-                dias        = item["dias"]
-                limit       = item["limit"]
+    resultado = {
+        "tabela": tabela,
+        "lidos": 0,
+        "coletados": 0,
+        "erro": None,
+        "buffer": {},
+    }
 
-                filtro_desc = []
-                if coluna_data and dias is not None:
-                    filtro_desc.append(f"{coluna_data} >= hoje-{dias}d")
-                if limit is not None:
-                    filtro_desc.append(f"LIMIT {limit}")
-                filtro_str = " | ".join(filtro_desc) if filtro_desc else "sem filtro"
+    try:
+        with psycopg2.connect(**PROD) as conn_prod:
+            conn_prod.autocommit = True
+            with conn_prod.cursor(cursor_factory=RealDictCursor) as cur_prod:
+                if not tabela_existe(cur_prod, schema=schema, tabela=tabela):
+                    tprint(f"[{tabela}] [AVISO] Tabela nao existe em producao, pulando.")
+                    return resultado
 
-                tqdm.write(f"\n{'─'*60}")
-                tqdm.write(f"Tabela: {tabela} | {filtro_str}")
+                registros = buscar_registros(
+                    cur_prod,
+                    schema=schema,
+                    tabela=tabela,
+                    coluna_data=coluna_data,
+                    dias=dias,
+                    limit=limit,
+                )
+                resultado["lidos"] = len(registros)
 
-                if not tabela_existe(cur_prod, tabela):
-                    tqdm.write(f"   [AVISO] Tabela não existe em produção, pulando.")
-                    continue
+                local_buffer: dict[str, dict[int, dict]] = {}
+                local_ja_coletados: set[tuple[str, int]] = set()
+                cache_colunas: dict[str, list[str]] = {}
 
-                registros = buscar_registros(cur_prod, tabela, coluna_data, dias, limit)
-                tqdm.write(f"   {len(registros)} registro(s) encontrado(s)")
+                for reg in registros:
+                    coletar_com_deps(
+                        cur_prod=cur_prod,
+                        schema=schema,
+                        tabela=tabela,
+                        registro=reg,
+                        ja_coletados=local_ja_coletados,
+                        cache_colunas=cache_colunas,
+                        buffer=local_buffer,
+                        dependencia_ignorar=dependencia_ignorar,
+                    )
 
-                with tqdm(total=len(registros), desc=f"  {tabela}",
-                          unit="reg", position=1, leave=False) as pbar:
-                    for reg in registros:
-                        coletar_com_deps(cur_prod, tabela, reg,
-                                         ja_coletados, cache_colunas, buffer)
-                        pbar.update(1)
+                resultado["coletados"] = sum(len(v) for v in local_buffer.values())
+                resultado["buffer"] = local_buffer
+                tprint(f"[{tabela}] lidos={resultado['lidos']} | coletados={resultado['coletados']}")
+    except Exception as e:
+        resultado["erro"] = str(e)
+        tprint(f"[{tabela}] [ERRO] {e}")
 
-    # Grava o .sql
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    return resultado
+
+
+def gerar_sql(
+    config_path: Path,
+    sql_path: Path,
+    schema: str,
+    out_dir: Path,
+    dependencia_ignorar: set[str],
+    workers: int | None,
+) -> int:
+    tabelas_conf, workers_conf = ler_config_tabelas_e_workers(config_path)
+    buffer: dict[str, dict[int, dict]] = {}
+    workers_base = workers if workers is not None else (workers_conf or MAX_WORKERS)
+    workers_exec = min(workers_base, len(tabelas_conf))
+    tprint(f"Config: {len(tabelas_conf)} tabela(s) | workers={workers_exec}")
+    if workers_conf:
+        tprint("  (workers definido via @workers no conf)")
+
+    resultados = []
+    with ThreadPoolExecutor(max_workers=workers_exec) as executor:
+        futures = {
+            executor.submit(processar_tabela, item, schema, dependencia_ignorar): item["tabela"]
+            for item in tabelas_conf
+        }
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processando tabelas", unit="tabela"):
+            resultados.append(future.result())
+
+    erros = [r for r in resultados if r["erro"]]
+    if erros:
+        tabelas_erro = ", ".join(sorted(r["tabela"] for r in erros))
+        raise RuntimeError(f"Falha em {len(erros)} tabela(s): {tabelas_erro}")
+
+    for r in resultados:
+        for tabela, registros_dict in r["buffer"].items():
+            destino = buffer.setdefault(tabela, {})
+            destino.update(registros_dict)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
     total = sum(len(v) for v in buffer.values())
 
     with open(sql_path, "w", encoding="utf-8") as f:
@@ -301,6 +228,7 @@ def gerar_sql(config_path: Path, sql_path: Path) -> int:
         f.write(f"-- Gerado em : {dt.datetime.now().isoformat()}\n")
         f.write(f"-- Origem    : {PROD['host']} / {PROD['dbname']}\n")
         f.write(f"-- Destino   : {DEV['host']} / {DEV['dbname']}\n")
+        f.write(f"-- Schema    : {schema}\n")
         f.write(f"-- Registros : {total}\n")
         f.write("-- =================================================\n\n")
         f.write("BEGIN;\n\n")
@@ -308,91 +236,100 @@ def gerar_sql(config_path: Path, sql_path: Path) -> int:
 
         for tabela, registros_dict in buffer.items():
             registros = list(registros_dict.values())
-            colunas   = list(registros[0].keys())
-            f.write(gerar_bloco_copy(tabela, colunas, registros))
+            if not registros:
+                continue
+            colunas = list(registros[0].keys())
+            f.write(gerar_bloco_copy(schema, tabela, colunas, registros))
             f.write("\n")
 
         f.write("SET LOCAL session_replication_role = origin;\n")
         f.write("COMMIT;\n")
 
-    tqdm.write(f"\n{'═'*60}")
-    tqdm.write(f"✔ .sql gerado : {sql_path}")
-    tqdm.write(f"  Tabelas     : {len(buffer)}")
-    tqdm.write(f"  Registros   : {total}")
+    tqdm.write(f"\n{'=' * 60}")
+    tqdm.write(f"OK .sql gerado : {sql_path}")
+    tqdm.write(f"  Tabelas      : {len(buffer)}")
+    tqdm.write(f"  Registros    : {total}")
     return total
 
-# =============================================================
-# APLICAÇÃO DO .SQL
-# =============================================================
-def aplicar_sql(sql_path: Path) -> None:
-    """Fase 2: aplica o .sql no banco dev via psql em uma única transação."""
-    if not sql_path.exists():
-        raise FileNotFoundError(f".sql não encontrado: {sql_path}")
 
-    if not Path(PSQL).exists():
-        raise FileNotFoundError(f"psql não encontrado: {PSQL}\nAjuste PG_BIN no script.")
+def aplicar_sql(sql_path: Path, psql_path: str) -> None:
+    if not sql_path.exists():
+        raise FileNotFoundError(f".sql nao encontrado: {sql_path}")
+
+    if not Path(psql_path).exists():
+        raise FileNotFoundError(f"psql nao encontrado: {psql_path}\nAjuste --psql ou PG_BIN.")
 
     env = os.environ.copy()
     env["PGPASSWORD"] = DEV["password"]
 
     cmd = [
-        PSQL,
-        "-h", DEV["host"],
-        "-p", str(DEV["port"]),
-        "-U", DEV["user"],
-        "-d", DEV["dbname"],
-        "-v", "ON_ERROR_STOP=1",
-        "-f", str(sql_path),
+        psql_path,
+        "-h",
+        DEV["host"],
+        "-p",
+        str(DEV["port"]),
+        "-U",
+        DEV["user"],
+        "-d",
+        DEV["dbname"],
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-f",
+        str(sql_path),
     ]
 
     print(f"\nAplicando {sql_path.name} no banco dev...")
-    p = subprocess.run(cmd, env=env, text=True, capture_output=True,
-                       encoding="utf-8", errors="replace")
+    p = subprocess.run(cmd, env=env, text=True, capture_output=True, encoding="utf-8", errors="replace")
 
     if p.returncode != 0:
-        raise RuntimeError(
-            f"Erro ao aplicar o .sql:\n\nSTDOUT:\n{p.stdout}\n\nSTDERR:\n{p.stderr}"
-        )
+        raise RuntimeError(f"Erro ao aplicar o .sql:\n\nSTDOUT:\n{p.stdout}\n\nSTDERR:\n{p.stderr}")
 
-    print("✔ Aplicado com sucesso!")
+    print("OK Aplicado com sucesso!")
 
-# =============================================================
-# MAIN
-# =============================================================
+
 def main():
-    parser = argparse.ArgumentParser(description="Replica dados de produção para dev via .sql.")
+    parser = argparse.ArgumentParser(description="Replica dados de producao para dev via .sql COPY.")
     default_config = Path(__file__).parent / "tabelas.conf"
-    parser.add_argument("--config",         default=str(default_config))
-    parser.add_argument("--dry-run",        action="store_true", help="Gera o .sql mas não aplica")
-    parser.add_argument("--apenas-gerar",   action="store_true", help="Só gera o .sql")
-    parser.add_argument("--apenas-aplicar", action="store_true", help="Aplica o último .sql gerado")
+    parser.add_argument("--config", default=str(default_config))
+    parser.add_argument("--schema", default=SCHEMA_DEFAULT, help=f"Schema de origem/destino (padrao: {SCHEMA_DEFAULT})")
+    parser.add_argument("--out-dir", default=str(OUT_DIR_DEFAULT), help=f"Pasta dos .sql gerados (padrao: {OUT_DIR_DEFAULT})")
+    parser.add_argument("--psql", default=PSQL_DEFAULT, help=f"Caminho completo do psql (padrao: {PSQL_DEFAULT})")
+    parser.add_argument("--workers", type=int_positivo, default=None, help=f"Numero de tabelas em paralelo (padrao: {MAX_WORKERS})")
+    parser.add_argument("--dry-run", action="store_true", help="Gera o .sql mas nao aplica")
+    parser.add_argument("--apenas-gerar", action="store_true", help="So gera o .sql")
+    parser.add_argument("--apenas-aplicar", action="store_true", help="Aplica o ultimo .sql gerado")
     args = parser.parse_args()
 
-    ts       = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    sql_path = OUT_DIR / f"dados_{ts}.sql"
+    out_dir = Path(args.out_dir)
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    sql_path = out_dir / f"dados_{ts}.sql"
 
-    # Modo: só aplicar o .sql mais recente
     if args.apenas_aplicar:
-        sqls = sorted(OUT_DIR.glob("dados_*.sql"), reverse=True)
+        sqls = sorted(out_dir.glob("dados_*.sql"), reverse=True)
         if not sqls:
-            raise FileNotFoundError(f"Nenhum .sql encontrado em {OUT_DIR}")
+            raise FileNotFoundError(f"Nenhum .sql encontrado em {out_dir}")
         sql_path = sqls[0]
         print(f"Usando .sql mais recente: {sql_path}")
-        aplicar_sql(sql_path)
+        aplicar_sql(sql_path, args.psql)
         return
 
-    # Fase 1: gera o .sql
-    gerar_sql(Path(args.config), sql_path)
+    gerar_sql(
+        config_path=Path(args.config),
+        sql_path=sql_path,
+        schema=args.schema,
+        out_dir=out_dir,
+        dependencia_ignorar=DEPENDENCIA_IGNORAR_DEFAULT,
+        workers=args.workers,
+    )
 
     if args.dry_run or args.apenas_gerar:
-        print("\n.sql gerado mas não aplicado (--dry-run / --apenas-gerar).")
+        print("\n.sql gerado mas nao aplicado (--dry-run / --apenas-gerar).")
         return
 
-    # Fase 2: aplica o .sql
-    aplicar_sql(sql_path)
+    aplicar_sql(sql_path, args.psql)
+    print(f"\n{'=' * 60}")
+    print("Concluido.")
 
-    print(f"\n{'═'*60}")
-    print("Concluído ✅")
 
 if __name__ == "__main__":
     main()
